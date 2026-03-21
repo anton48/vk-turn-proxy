@@ -1,0 +1,14 @@
+# Build artifacts
+ios/WireGuardBridge/build/
+ios/VKTurnProxy/VKTurnProxy.xcodeproj/
+
+# Xcode
+*.xcuserdata
+DerivedData/
+*.xcworkspace
+
+# Go
+vendor/
+
+# macOS
+.DS_Store
