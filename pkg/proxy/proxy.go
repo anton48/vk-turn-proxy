@@ -44,10 +44,11 @@ type Stats struct {
 // Proxy manages the DTLS+TURN tunnel to the peer server.
 type Proxy struct {
 	config Config
-	ctx    context.Context
+	ctx    context.Context    // global lifetime (wgTurnOn → wgTurnOff)
 	cancel context.CancelFunc
 
-	peer *net.UDPAddr
+	peer   *net.UDPAddr
+	linkID string
 
 	// For packet I/O from the WireGuard side
 	sendCh chan []byte
@@ -56,6 +57,11 @@ type Proxy struct {
 	wg sync.WaitGroup
 
 	started atomic.Bool
+
+	// Active session context (cancelled on Pause, recreated on Resume)
+	sessMu     sync.Mutex
+	sessCtx    context.Context
+	sessCancel context.CancelFunc
 
 	// TURN server IP discovered after connecting to VK
 	turnServerIP atomic.Value // stores string
@@ -76,12 +82,15 @@ func NewProxy(cfg Config) *Proxy {
 		cfg.NumConns = 1
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	sessCtx, sessCancel := context.WithCancel(ctx)
 	return &Proxy{
-		config: cfg,
-		ctx:    ctx,
-		cancel: cancel,
-		sendCh: make(chan []byte, 256),
-		recvCh: make(chan []byte, 256),
+		config:     cfg,
+		ctx:        ctx,
+		cancel:     cancel,
+		sendCh:     make(chan []byte, 256),
+		recvCh:     make(chan []byte, 256),
+		sessCtx:    sessCtx,
+		sessCancel: sessCancel,
 	}
 }
 
@@ -101,6 +110,7 @@ func (p *Proxy) Start() error {
 	if idx := strings.IndexAny(linkID, "/?#"); idx != -1 {
 		linkID = linkID[:idx]
 	}
+	p.linkID = linkID
 
 	// Resolve peer address
 	peer, err := net.ResolveUDPAddr("udp", p.config.PeerAddr)
@@ -109,14 +119,22 @@ func (p *Proxy) Start() error {
 	}
 	p.peer = peer
 
-	// Start the first connection and wait for it to succeed
+	return p.startConnections()
+}
+
+// startConnections launches all connection goroutines using the current session context.
+func (p *Proxy) startConnections() error {
+	p.sessMu.Lock()
+	sessCtx := p.sessCtx
+	p.sessMu.Unlock()
+
 	readyCh := make(chan struct{}, 1)
 	errCh := make(chan error, 1)
 
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
-		err := p.runConnection(linkID, readyCh)
+		err := p.runConnection(sessCtx, p.linkID, readyCh)
 		if err != nil {
 			select {
 			case errCh <- err:
@@ -127,23 +145,38 @@ func (p *Proxy) Start() error {
 
 	select {
 	case <-readyCh:
-		// First connection established
 	case err := <-errCh:
 		return fmt.Errorf("first connection failed: %w", err)
 	case <-p.ctx.Done():
 		return p.ctx.Err()
 	}
 
-	// Start additional connections
 	for i := 1; i < p.config.NumConns; i++ {
 		p.wg.Add(1)
 		go func() {
 			defer p.wg.Done()
-			p.runConnection(linkID, nil)
+			p.runConnection(sessCtx, p.linkID, nil)
 		}()
 	}
 
 	return nil
+}
+
+// Pause gracefully stops all connections (for sleep).
+func (p *Proxy) Pause() {
+	p.sessMu.Lock()
+	p.sessCancel()
+	p.sessMu.Unlock()
+	log.Printf("proxy: Pause — all connections cancelled")
+}
+
+// Resume restarts all connections (for wake).
+func (p *Proxy) Resume() {
+	p.sessMu.Lock()
+	p.sessCtx, p.sessCancel = context.WithCancel(p.ctx)
+	p.sessMu.Unlock()
+	log.Printf("proxy: Resume — starting fresh connections")
+	go p.startConnections()
 }
 
 // SendPacket sends a WireGuard packet through the tunnel.
@@ -201,31 +234,58 @@ func (p *Proxy) Stop() {
 }
 
 // runConnection runs a single connection slot with reconnection.
-// DTLS reconnects only when the DTLS layer itself fails.
-// TURN reconnects underneath DTLS with fresh VK credentials only on failure.
-func (p *Proxy) runConnection(linkID string, readyCh chan<- struct{}) error {
+// Reconnects on failure until sessCtx is cancelled (Pause/Resume) or global ctx is done (Stop).
+// After 3 consecutive short-lived failures, goes dormant until Resume() restarts via sessCtx.
+func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh chan<- struct{}) error {
 	signaled := false
+	shortFailures := 0
+
 	for {
 		select {
+		case <-sessCtx.Done():
+			return sessCtx.Err()
 		case <-p.ctx.Done():
 			return p.ctx.Err()
 		default:
 		}
 
+		start := time.Now()
 		var err error
 		if p.config.UseDTLS {
-			err = p.runDTLSSession(linkID, readyCh, &signaled)
+			err = p.runDTLSSession(sessCtx, linkID, readyCh, &signaled)
 		} else {
-			err = p.runDirectSession(linkID, readyCh, &signaled)
+			err = p.runDirectSession(sessCtx, linkID, readyCh, &signaled)
 		}
 		if err != nil {
-			log.Printf("proxy: session ended: %s", err)
+			duration := time.Since(start)
+			log.Printf("proxy: session ended after %s: %s", duration.Round(time.Second), err)
 			if !signaled && readyCh != nil {
-				return err // first connection failed — propagate
+				return err
 			}
-			// Reconnect DTLS after delay
+
+			if duration > 5*time.Minute {
+				shortFailures = 0 // session was healthy
+			} else {
+				shortFailures++
+			}
+
+			// After 3 consecutive short-lived failures, go dormant.
+			// Device is likely sleeping. Wait for Resume() (which cancels sessCtx).
+			if shortFailures >= 3 {
+				log.Printf("proxy: %d consecutive short failures, going dormant until Resume()", shortFailures)
+				select {
+				case <-sessCtx.Done():
+					return sessCtx.Err()
+				case <-p.ctx.Done():
+					return p.ctx.Err()
+				}
+			}
+
+			// Brief delay before reconnect
 			select {
 			case <-time.After(2 * time.Second):
+			case <-sessCtx.Done():
+				return sessCtx.Err()
 			case <-p.ctx.Done():
 				return p.ctx.Err()
 			}
@@ -256,8 +316,8 @@ func (p *Proxy) resolveTURNAddr(linkID string) (string, *TURNCreds, error) {
 // runDTLSSession runs a long-lived DTLS session.
 // DTLS stays alive while TURN reconnects underneath with fresh creds only on failure.
 // Only returns when DTLS itself fails (then the caller restarts everything).
-func (p *Proxy) runDTLSSession(linkID string, readyCh chan<- struct{}, signaled *bool) error {
-	connCtx, connCancel := context.WithCancel(p.ctx)
+func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh chan<- struct{}, signaled *bool) error {
+	connCtx, connCancel := context.WithCancel(sessCtx)
 	defer connCancel()
 
 	// Create AsyncPacketPipe: conn1 = DTLS transport, conn2 = TURN transport.
@@ -372,7 +432,7 @@ func (p *Proxy) runDTLSSession(linkID string, readyCh chan<- struct{}, signaled 
 			}
 			if retries >= 5 {
 				log.Printf("proxy: TURN reconnection failed after 5 attempts, giving up")
-				return // connCancel will kill DTLS
+				return // session dies → runConnection will wait 5 min or ForceReconnect
 			}
 		}
 	}()
@@ -404,7 +464,7 @@ func (p *Proxy) runDTLSSession(linkID string, readyCh chan<- struct{}, signaled 
 		defer connCancel()
 		buf := make([]byte, 1600)
 		for {
-			dtlsConn.SetReadDeadline(time.Now().Add(15 * time.Minute))
+			dtlsConn.SetReadDeadline(time.Now().Add(4 * time.Hour))
 			n, err := dtlsConn.Read(buf)
 			if err != nil {
 				return
@@ -425,8 +485,8 @@ func (p *Proxy) runDTLSSession(linkID string, readyCh chan<- struct{}, signaled 
 
 // runDirectSession runs a direct TURN session (no DTLS).
 // TURN reconnects with fresh creds only on failure.
-func (p *Proxy) runDirectSession(linkID string, readyCh chan<- struct{}, signaled *bool) error {
-	connCtx, connCancel := context.WithCancel(p.ctx)
+func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh chan<- struct{}, signaled *bool) error {
+	connCtx, connCancel := context.WithCancel(sessCtx)
 	defer connCancel()
 
 	conn1, conn2 := connutil.AsyncPacketPipe()
@@ -524,7 +584,7 @@ func (p *Proxy) runDirectSession(linkID string, readyCh chan<- struct{}, signale
 		defer connCancel()
 		buf := make([]byte, 1600)
 		for {
-			conn1.SetReadDeadline(time.Now().Add(15 * time.Minute))
+			conn1.SetReadDeadline(time.Now().Add(4 * time.Hour))
 			n, _, err := conn1.ReadFrom(buf)
 			if err != nil {
 				return

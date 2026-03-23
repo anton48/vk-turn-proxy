@@ -34,6 +34,12 @@ const char *wgGetTURNServerIP(int32_t tunnelHandle);
 /// @return JSON string (caller must free), empty "{}" if tunnel not found
 const char *wgGetStats(int32_t tunnelHandle);
 
+/// Pause all proxy connections (call from sleep()).
+void wgPause(int32_t tunnelHandle);
+
+/// Resume proxy connections (call from wake()).
+void wgResume(int32_t tunnelHandle);
+
 /// Get library version.
 /// @return Version string
 const char *wgVersion(void);

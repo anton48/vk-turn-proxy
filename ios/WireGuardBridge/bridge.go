@@ -218,6 +218,36 @@ func wgGetStats(tunnelHandle C.int32_t) *C.char {
 	return C.CString(string(data))
 }
 
+//export wgPause
+func wgPause(tunnelHandle C.int32_t) {
+	id := int32(tunnelHandle)
+	tunnelsMu.Lock()
+	entry, ok := tunnels[id]
+	tunnelsMu.Unlock()
+
+	if !ok {
+		return
+	}
+
+	log.Printf("wgPause: pausing tunnel %d", id)
+	entry.proxy.Pause()
+}
+
+//export wgResume
+func wgResume(tunnelHandle C.int32_t) {
+	id := int32(tunnelHandle)
+	tunnelsMu.Lock()
+	entry, ok := tunnels[id]
+	tunnelsMu.Unlock()
+
+	if !ok {
+		return
+	}
+
+	log.Printf("wgResume: resuming tunnel %d", id)
+	entry.proxy.Resume()
+}
+
 //export wgVersion
 func wgVersion() *C.char {
 	return C.CString("0.1.0-turn")

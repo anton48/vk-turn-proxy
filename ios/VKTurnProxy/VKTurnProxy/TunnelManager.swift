@@ -1,6 +1,7 @@
 import Foundation
 import Network
 import NetworkExtension
+import UIKit
 
 // MARK: - Tunnel Statistics
 
@@ -32,6 +33,7 @@ class TunnelManager: ObservableObject {
 
     private var manager: NETunnelProviderManager?
     private var statusObserver: NSObjectProtocol?
+    private var foregroundObserver: NSObjectProtocol?
     private var statsTimer: Timer?
 
     // For rate calculation
@@ -45,6 +47,19 @@ class TunnelManager: ObservableObject {
     init() {
         Task {
             await loadManager()
+        }
+        // Restart stats polling when app returns from background
+        foregroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self = self else { return }
+                if self.status == .connected {
+                    self.startStatsPolling(reset: false)
+                }
+            }
         }
     }
 
@@ -136,11 +151,20 @@ class TunnelManager: ObservableObject {
         }
     }
 
-    private func startStatsPolling() {
-        stopStatsPolling()
+    private func startStatsPolling(reset: Bool = true) {
+        statsTimer?.invalidate()
+        statsTimer = nil
+        if reset {
+            stats = TunnelStats()
+            txRate = 0
+            rxRate = 0
+            internetRTTms = 0
+        }
         prevTx = 0
         prevRx = 0
         prevTime = Date()
+        // Fetch immediately, then every 2 seconds
+        fetchStats()
         statsTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.fetchStats()

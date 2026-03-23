@@ -164,6 +164,21 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
+    override func sleep(completionHandler: @escaping () -> Void) {
+        logMsg("sleep() — pausing proxy connections")
+        if tunnelHandle >= 0 {
+            wgPause(tunnelHandle)
+        }
+        completionHandler()
+    }
+
+    override func wake() {
+        logMsg("wake() — resuming proxy connections")
+        if tunnelHandle >= 0 {
+            wgResume(tunnelHandle)
+        }
+    }
+
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
         if tunnelHandle >= 0 {
             wgTurnOff(tunnelHandle)
