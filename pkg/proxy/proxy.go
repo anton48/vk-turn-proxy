@@ -553,6 +553,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	// The same conn2 is reused — DTLS doesn't see the reconnection.
 	go func() {
 		defer connCancel() // if TURN loop gives up, kill DTLS too
+		turnStart := time.Now()
 		for {
 			// Wait for current TURN to finish (it runs until failure)
 			select {
@@ -565,20 +566,29 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 				return
 			}
 
+			turnAge := time.Since(turnStart)
 			p.reconnects.Add(1)
-		log.Printf("proxy: TURN session ended, reconnecting...")
+			log.Printf("proxy: TURN session ended after %s, reconnecting...", turnAge.Round(time.Second))
 
-			// Brief pause before reconnecting
+			// If TURN session was short-lived, the credentials are likely expired.
+			// Invalidate cache so the next resolveTURNAddr fetches fresh creds.
+			if turnAge < 30*time.Second {
+				p.cachedCredsMu.Lock()
+				p.cachedCreds = nil
+				p.cachedCredsMu.Unlock()
+				log.Printf("proxy: short-lived TURN session (%s), invalidated credential cache", turnAge.Round(time.Second))
+			}
+
+			// Brief pause before reconnecting (longer for short-lived sessions)
+			delay := 500 * time.Millisecond
+			if turnAge < 5*time.Second {
+				delay = 3 * time.Second
+			}
 			select {
-			case <-time.After(500 * time.Millisecond):
+			case <-time.After(delay):
 			case <-connCtx.Done():
 				return
 			}
-
-			// Invalidate cached creds so we fetch fresh ones
-			p.cachedCredsMu.Lock()
-			p.cachedCreds = nil
-			p.cachedCredsMu.Unlock()
 
 			// Get fresh VK credentials and reconnect TURN
 			retries := 0
@@ -591,7 +601,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 					retries++
 					log.Printf("proxy: TURN creds fetch failed (attempt %d/5): %s", retries, err)
 					select {
-					case <-time.After(time.Duration(retries) * time.Second):
+					case <-time.After(time.Duration(retries) * 2 * time.Second):
 					case <-connCtx.Done():
 						return
 					}
@@ -599,6 +609,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 				}
 
 				log.Printf("proxy: starting new TURN session (attempt %d)", retries+1)
+				turnStart = time.Now()
 				turnDone = make(chan error, 1)
 				go func() {
 					turnDone <- p.runTURN(connCtx, newAddr, newCreds, conn2)
