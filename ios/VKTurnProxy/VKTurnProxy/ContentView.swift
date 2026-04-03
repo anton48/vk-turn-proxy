@@ -1,5 +1,9 @@
 import SwiftUI
 import NetworkExtension
+import WebKit
+import os.log
+
+private let captchaLog = OSLog(subsystem: "com.vkturnproxy.app", category: "Captcha")
 
 struct ContentView: View {
     @StateObject private var tunnel = TunnelManager()
@@ -14,7 +18,7 @@ struct ContentView: View {
     @AppStorage("vkLink") private var vkLink = ""
     @AppStorage("peerAddress") private var peerAddress = ""
     @AppStorage("useDTLS") private var useDTLS = true
-    @AppStorage("numConnections") private var numConnections = 16
+    @AppStorage("numConnections") private var numConnections = 10
 
     var body: some View {
         NavigationView {
@@ -86,6 +90,25 @@ struct ContentView: View {
                 .padding(.bottom, 24)
             }
             .navigationTitle("VK Turn Proxy")
+            .sheet(isPresented: $tunnel.captchaPending) {
+                if let urlStr = tunnel.captchaImageURL, let url = URL(string: urlStr) {
+                    CaptchaWebView(
+                        url: url,
+                        captchaSID: tunnel.captchaSID ?? "",
+                        onSolved: { token in
+                            NSLog("[Captcha] Token received (%d chars), sending to tunnel", token.count)
+                            tunnel.solveCaptcha(answer: token)
+                        },
+                        onDismiss: {
+                            // Don't send fake answer — just dismiss the sheet.
+                            // The captcha will re-appear on next poll if not actually solved.
+                            NSLog("[Captcha] Sheet dismissed without token")
+                            tunnel.captchaPending = false
+                            tunnel.captchaImageURL = nil
+                        }
+                    )
+                }
+            }
         }
     }
 
@@ -139,7 +162,7 @@ struct SettingsView: View {
     @AppStorage("vkLink") private var vkLink = ""
     @AppStorage("peerAddress") private var peerAddress = ""
     @AppStorage("useDTLS") private var useDTLS = true
-    @AppStorage("numConnections") private var numConnections = 16
+    @AppStorage("numConnections") private var numConnections = 10
 
     var body: some View {
         Form {
@@ -249,6 +272,174 @@ struct StatBox: View {
         .padding(.vertical, 6)
         .background(Color(.systemGray6))
         .cornerRadius(8)
+    }
+}
+
+// MARK: - Captcha WebView (captures token via JS interception)
+
+struct CaptchaWebView: View {
+    let url: URL
+    let captchaSID: String
+    let onSolved: (String) -> Void
+    let onDismiss: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Solve Captcha")
+                    .font(.headline)
+                Spacer()
+                Button("Done") { onDismiss() }
+                    .font(.headline)
+            }
+            .padding()
+
+            CaptchaWKWebView(url: url, onTokenCaptured: onSolved)
+        }
+    }
+}
+
+struct CaptchaWKWebView: UIViewRepresentable {
+    let url: URL
+    let onTokenCaptured: (String) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onTokenCaptured: onTokenCaptured)
+    }
+
+    func makeUIView(context: Context) -> WKWebView {
+        let config = WKWebViewConfiguration()
+        config.allowsInlineMediaPlayback = true
+
+        let contentController = WKUserContentController()
+        contentController.add(context.coordinator, name: "captchaToken")
+
+        // Approach based on https://github.com/cacggghp/vk-turn-proxy/pull/97:
+        // Load the captcha page directly (top-level, no iframe needed).
+        // Intercept fetch/XHR to captchaNotRobot.check — the response contains
+        // success_token which is what VK needs for the retry.
+        // No need for postMessage interception or iframe wrapper.
+        let js = """
+        (function() {
+            var h = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.captchaToken;
+            if (!h) return;
+
+            // Hook fetch to intercept captchaNotRobot.check response
+            var origFetch = window.fetch;
+            window.fetch = function() {
+                var url = arguments[0];
+                if (typeof url === 'object' && url.url) url = url.url;
+                var urlStr = String(url);
+                var p = origFetch.apply(this, arguments);
+                if (urlStr.indexOf('captchaNotRobot.check') !== -1) {
+                    p.then(function(response) {
+                        return response.clone().json();
+                    }).then(function(data) {
+                        h.postMessage('check:' + JSON.stringify(data).substring(0, 1000));
+                        if (data.response && data.response.success_token) {
+                            h.postMessage('token:' + data.response.success_token);
+                        }
+                    }).catch(function(e) {
+                        h.postMessage('check-err:' + e.message);
+                    });
+                }
+                return p;
+            };
+
+            // Hook XMLHttpRequest as fallback
+            var origOpen = XMLHttpRequest.prototype.open;
+            var origSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.open = function(method, url) {
+                this._url = url;
+                return origOpen.apply(this, arguments);
+            };
+            XMLHttpRequest.prototype.send = function() {
+                var xhr = this;
+                if (this._url && String(this._url).indexOf('captchaNotRobot.check') !== -1) {
+                    xhr.addEventListener('load', function() {
+                        try {
+                            var data = JSON.parse(xhr.responseText);
+                            h.postMessage('xhr-check:' + JSON.stringify(data).substring(0, 1000));
+                            if (data.response && data.response.success_token) {
+                                h.postMessage('token:' + data.response.success_token);
+                            }
+                        } catch(e) {}
+                    });
+                }
+                return origSend.apply(this, arguments);
+            };
+
+            h.postMessage('init:hooks installed');
+        })();
+        """
+        let userScript = WKUserScript(source: js, injectionTime: .atDocumentStart, forMainFrameOnly: false)
+        contentController.addUserScript(userScript)
+        config.userContentController = contentController
+
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.navigationDelegate = context.coordinator
+        context.coordinator.webView = webView
+        webView.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+
+        // Load captcha URL directly — no iframe needed
+        webView.load(URLRequest(url: url))
+        return webView
+    }
+
+    func updateUIView(_ uiView: WKWebView, context: Context) {}
+
+    class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
+        let onTokenCaptured: (String) -> Void
+        private var solved = false
+        weak var webView: WKWebView?
+
+        init(onTokenCaptured: @escaping (String) -> Void) {
+            self.onTokenCaptured = onTokenCaptured
+        }
+
+        private func log(_ msg: String) {
+            os_log("%{public}s", log: captchaLog, type: .default, msg)
+            NSLog("[Captcha] %@", msg)
+        }
+
+        func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            guard let body = message.body as? String else { return }
+            log("JS: \(String(body.prefix(400)))")
+
+            if body.hasPrefix("token:") {
+                let token = String(body.dropFirst(6))
+                log("SUCCESS_TOKEN (\(token.count) chars)")
+                captureToken(token)
+            }
+        }
+
+        private func captureToken(_ token: String) {
+            guard !solved else { return }
+            solved = true
+            log("TOKEN CAPTURED (\(token.count) chars), sending to tunnel")
+            DispatchQueue.main.async {
+                self.onTokenCaptured(token)
+            }
+        }
+
+        func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+            if let url = navigationAction.request.url {
+                log("Nav: \(String(url.absoluteString.prefix(200)))")
+            }
+            decisionHandler(.allow)
+        }
+
+        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+            log("FAIL: \(error.localizedDescription)")
+        }
+
+        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            log("FAIL provisional: \(error.localizedDescription)")
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            log("Loaded: \(String((webView.url?.absoluteString ?? "nil").prefix(150)))")
+        }
     }
 }
 

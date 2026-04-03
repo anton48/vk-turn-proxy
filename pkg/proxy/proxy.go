@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -20,13 +21,14 @@ import (
 
 // Config holds proxy configuration.
 type Config struct {
-	PeerAddr   string // vk-turn-proxy server address (host:port)
-	TurnServer string // override TURN server host (optional)
-	TurnPort   string // override TURN port (optional)
-	VKLink     string // VK call invite link or link ID
-	UseDTLS    bool   // true = DTLS obfuscation (default mode)
-	UseUDP     bool   // true = UDP to TURN, false = TCP
-	NumConns   int    // number of concurrent connections (default 1)
+	PeerAddr       string         // vk-turn-proxy server address (host:port)
+	TurnServer     string         // override TURN server host (optional)
+	TurnPort       string         // override TURN port (optional)
+	VKLink         string         // VK call invite link or link ID
+	UseDTLS        bool           // true = DTLS obfuscation (default mode)
+	UseUDP         bool           // true = UDP to TURN, false = TCP
+	NumConns       int            // number of concurrent connections (default 1)
+	CaptchaSolver  CaptchaSolver  // called when VK requires captcha (may be nil)
 }
 
 // Stats holds live tunnel statistics.
@@ -39,6 +41,8 @@ type Stats struct {
 	DTLSHandshakeMs   float64 `json:"dtls_handshake_ms"`   // last DTLS handshake time
 	LastHandshakeSec  int64   `json:"last_handshake_sec"`  // seconds since last WG handshake
 	Reconnects        int64   `json:"reconnects"`          // total TURN reconnects
+	CaptchaImageURL   string  `json:"captcha_image_url,omitempty"` // non-empty when captcha is pending
+	CaptchaSID        string  `json:"captcha_sid,omitempty"`       // captcha_sid for the pending captcha
 }
 
 // Proxy manages the DTLS+TURN tunnel to the peer server.
@@ -66,6 +70,23 @@ type Proxy struct {
 	// TURN server IP discovered after connecting to VK
 	turnServerIP atomic.Value // stores string
 
+	// Captcha handling: when VK requires captcha, the image URL is stored here
+	// and the solver blocks until an answer is provided via SolveCaptcha().
+	captchaImageURL  atomic.Value // stores string (empty = no captcha pending)
+	captchaCh        chan string  // buffered channel for captcha answers
+	lastCaptchaSID     atomic.Value // stores string: captcha_sid from last CaptchaRequiredError
+	lastCaptchaKey     atomic.Value // stores string: success_token from captchaNotRobot.check
+	lastCaptchaTs      atomic.Value // stores float64: captcha_ts from error response
+	lastCaptchaAttempt atomic.Value // stores float64: captcha_attempt from error response
+	lastCaptchaToken1  atomic.Value // stores string: step1 access_token to reuse on retry
+
+	// Cached TURN credentials: shared across all connections so only one
+	// GetVKCreds call is needed (avoids per-connection captcha).
+	cachedCredsMu   sync.Mutex
+	cachedTURNAddr  string
+	cachedCreds     *TURNCreds
+	cachedCredsTime time.Time
+
 	// Stats
 	txBytes      atomic.Int64
 	rxBytes      atomic.Int64
@@ -83,7 +104,7 @@ func NewProxy(cfg Config) *Proxy {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	sessCtx, sessCancel := context.WithCancel(ctx)
-	return &Proxy{
+	p := &Proxy{
 		config:     cfg,
 		ctx:        ctx,
 		cancel:     cancel,
@@ -91,7 +112,14 @@ func NewProxy(cfg Config) *Proxy {
 		recvCh:     make(chan []byte, 256),
 		sessCtx:    sessCtx,
 		sessCancel: sessCancel,
+		captchaCh:  make(chan string, 1),
 	}
+	// If no external solver provided, use the built-in channel-based solver
+	// that waits for SolveCaptcha() to be called (e.g. from iOS UI).
+	if p.config.CaptchaSolver == nil {
+		p.config.CaptchaSolver = p.waitForCaptchaAnswer
+	}
+	return p
 }
 
 // Start establishes the DTLS+TURN connection chain.
@@ -146,6 +174,19 @@ func (p *Proxy) startConnections() error {
 	select {
 	case <-readyCh:
 	case err := <-errCh:
+		// If captcha is required during initial connection, don't fail —
+		// publish the captcha and wait for the user to solve it.
+		var captchaErr *CaptchaRequiredError
+		if errors.As(err, &captchaErr) {
+			log.Printf("proxy: captcha required during startup, waiting for solution")
+			p.captchaImageURL.Store(captchaErr.ImageURL)
+			p.lastCaptchaSID.Store(captchaErr.SID)
+			p.lastCaptchaTs.Store(captchaErr.CaptchaTs)
+			p.lastCaptchaAttempt.Store(captchaErr.CaptchaAttempt)
+			p.lastCaptchaToken1.Store(captchaErr.Token1)
+			go p.waitCaptchaAndRestart()
+			return nil // tunnel "starts" in captcha-pending mode
+		}
 		return fmt.Errorf("first connection failed: %w", err)
 	case <-p.ctx.Done():
 		return p.ctx.Err()
@@ -162,11 +203,38 @@ func (p *Proxy) startConnections() error {
 	return nil
 }
 
+// waitCaptchaAndRestart waits for captcha answer, then restarts connections.
+// After the user solves the captcha in the WebView, VK validates it server-side
+// (tied to the captcha_sid). We simply restart connections — VK should
+// accept the next request from this IP without another captcha.
+func (p *Proxy) waitCaptchaAndRestart() {
+	// Drain any stale answer
+	select {
+	case <-p.captchaCh:
+	default:
+	}
+
+	select {
+	case answer := <-p.captchaCh:
+		p.captchaImageURL.Store("")
+		p.lastCaptchaKey.Store(answer)
+		log.Printf("proxy: captcha answered (%d chars), restarting connections (will use stored captcha_sid + key)", len(answer))
+		p.Resume()
+	case <-p.ctx.Done():
+		p.captchaImageURL.Store("")
+		p.lastCaptchaSID.Store("")
+	}
+}
+
 // Pause gracefully stops all connections (for sleep).
 func (p *Proxy) Pause() {
 	p.sessMu.Lock()
 	p.sessCancel()
 	p.sessMu.Unlock()
+	// Invalidate cached creds so Resume fetches fresh ones
+	p.cachedCredsMu.Lock()
+	p.cachedCreds = nil
+	p.cachedCredsMu.Unlock()
 	log.Printf("proxy: Pause — all connections cancelled")
 }
 
@@ -207,6 +275,14 @@ func (p *Proxy) ReceivePacket(buf []byte) (int, error) {
 
 // GetStats returns current tunnel statistics.
 func (p *Proxy) GetStats() Stats {
+	var captchaURL string
+	if v := p.captchaImageURL.Load(); v != nil {
+		captchaURL = v.(string)
+	}
+	var captchaSID string
+	if v := p.lastCaptchaSID.Load(); v != nil {
+		captchaSID = v.(string)
+	}
 	return Stats{
 		TxBytes:          p.txBytes.Load(),
 		RxBytes:          p.rxBytes.Load(),
@@ -215,6 +291,41 @@ func (p *Proxy) GetStats() Stats {
 		TurnRTTms:        float64(p.turnRTTns.Load()) / 1e6,
 		DTLSHandshakeMs:  float64(p.dtlsHSns.Load()) / 1e6,
 		Reconnects:       p.reconnects.Load(),
+		CaptchaImageURL:  captchaURL,
+		CaptchaSID:       captchaSID,
+	}
+}
+
+// waitForCaptchaAnswer is the built-in CaptchaSolver that publishes the captcha
+// image URL via stats and blocks until SolveCaptcha() is called.
+func (p *Proxy) waitForCaptchaAnswer(imageURL string) (string, error) {
+	log.Printf("proxy: captcha required, waiting for answer (image: %s)", imageURL)
+	p.captchaImageURL.Store(imageURL)
+
+	// Drain any stale answer
+	select {
+	case <-p.captchaCh:
+	default:
+	}
+
+	select {
+	case answer := <-p.captchaCh:
+		p.captchaImageURL.Store("") // clear pending state
+		log.Printf("proxy: captcha answer received")
+		return answer, nil
+	case <-p.ctx.Done():
+		p.captchaImageURL.Store("")
+		return "", p.ctx.Err()
+	}
+}
+
+// SolveCaptcha provides the answer to a pending captcha challenge.
+// Called from the iOS UI via the bridge.
+func (p *Proxy) SolveCaptcha(answer string) {
+	select {
+	case p.captchaCh <- answer:
+	default:
+		log.Printf("proxy: SolveCaptcha called but no captcha pending")
 	}
 }
 
@@ -238,6 +349,9 @@ func (p *Proxy) Stop() {
 // After 3 consecutive short-lived failures, goes dormant until Resume() restarts via sessCtx.
 func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh chan<- struct{}) error {
 	signaled := false
+	// allowCaptchaBlock is false for the initial connection (readyCh != nil && !signaled)
+	// because the tunnel isn't running yet, so the UI can't show the captcha.
+	// Once the tunnel is established (signaled=true), blocking captcha is safe.
 	shortFailures := 0
 
 	for {
@@ -294,8 +408,57 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 }
 
 // resolveTURNAddr fetches VK credentials and resolves the TURN server address.
-func (p *Proxy) resolveTURNAddr(linkID string) (string, *TURNCreds, error) {
-	creds, err := GetVKCreds(linkID)
+// Uses cached credentials if available (< 60s old) to avoid per-connection captcha.
+// Serializes VK API calls: if one goroutine is fetching creds, others wait for the result.
+// If allowCaptchaBlock is false, captcha returns an error instead of blocking.
+func (p *Proxy) resolveTURNAddr(linkID string, allowCaptchaBlock bool) (string, *TURNCreds, error) {
+	p.cachedCredsMu.Lock()
+	// Check cache under lock — if fresh, return immediately
+	if p.cachedCreds != nil && time.Since(p.cachedCredsTime) < 5*time.Minute {
+		addr := p.cachedTURNAddr
+		creds := p.cachedCreds
+		p.cachedCredsMu.Unlock()
+		log.Printf("proxy: using cached TURN creds (age %s)", time.Since(p.cachedCredsTime).Round(time.Second))
+		return addr, creds, nil
+	}
+	// Hold lock while fetching — other goroutines will block on cachedCredsMu.Lock()
+	// and then find the cache populated. This prevents 10 parallel GetVKCreds calls.
+	defer p.cachedCredsMu.Unlock()
+
+	var solver CaptchaSolver
+	if allowCaptchaBlock {
+		solver = p.config.CaptchaSolver
+	}
+	// Check if we have a solved captcha (success_token from captchaNotRobot.check)
+	var solvedSID, solvedKey string
+	var solvedTs, solvedAttempt float64
+	if v := p.lastCaptchaSID.Load(); v != nil {
+		solvedSID, _ = v.(string)
+		if solvedSID != "" {
+			p.lastCaptchaSID.Store("") // consume it (one-time use)
+		}
+	}
+	if v := p.lastCaptchaKey.Load(); v != nil {
+		solvedKey, _ = v.(string)
+		if solvedKey != "" {
+			p.lastCaptchaKey.Store("") // consume it
+		}
+	}
+	if v := p.lastCaptchaTs.Load(); v != nil {
+		solvedTs, _ = v.(float64)
+	}
+	if v := p.lastCaptchaAttempt.Load(); v != nil {
+		solvedAttempt, _ = v.(float64)
+	}
+	var savedToken1 string
+	if v := p.lastCaptchaToken1.Load(); v != nil {
+		savedToken1, _ = v.(string)
+		if savedToken1 != "" {
+			p.lastCaptchaToken1.Store("") // consume it
+		}
+	}
+	// solver=nil → CaptchaRequiredError if captcha needed (non-blocking)
+	creds, err := GetVKCreds(linkID, solver, solvedSID, solvedKey, solvedTs, solvedAttempt, savedToken1)
 	if err != nil {
 		return "", nil, fmt.Errorf("get VK creds: %w", err)
 	}
@@ -310,7 +473,14 @@ func (p *Proxy) resolveTURNAddr(linkID string) (string, *TURNCreds, error) {
 		turnPort = p.config.TurnPort
 	}
 	p.turnServerIP.Store(turnHost)
-	return net.JoinHostPort(turnHost, turnPort), creds, nil
+	addr := net.JoinHostPort(turnHost, turnPort)
+
+	// Cache the credentials for other connections to reuse
+	p.cachedTURNAddr = addr
+	p.cachedCreds = creds
+	p.cachedCredsTime = time.Now()
+
+	return addr, creds, nil
 }
 
 // runDTLSSession runs a long-lived DTLS session.
@@ -327,7 +497,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	defer conn2.Close()
 
 	// Get initial credentials and start first TURN relay
-	turnAddr, creds, err := p.resolveTURNAddr(linkID)
+	turnAddr, creds, err := p.resolveTURNAddr(linkID, *signaled)
 	if err != nil {
 		return err
 	}
@@ -405,13 +575,18 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 				return
 			}
 
+			// Invalidate cached creds so we fetch fresh ones
+			p.cachedCredsMu.Lock()
+			p.cachedCreds = nil
+			p.cachedCredsMu.Unlock()
+
 			// Get fresh VK credentials and reconnect TURN
 			retries := 0
 			for retries < 5 {
 				if connCtx.Err() != nil {
 					return
 				}
-				newAddr, newCreds, err := p.resolveTURNAddr(linkID)
+				newAddr, newCreds, err := p.resolveTURNAddr(linkID, true)
 				if err != nil {
 					retries++
 					log.Printf("proxy: TURN creds fetch failed (attempt %d/5): %s", retries, err)
@@ -497,7 +672,7 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 		conn1.Close()
 	})
 
-	turnAddr, creds, err := p.resolveTURNAddr(linkID)
+	turnAddr, creds, err := p.resolveTURNAddr(linkID, *signaled)
 	if err != nil {
 		return err
 	}
@@ -538,7 +713,7 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 				if connCtx.Err() != nil {
 					return
 				}
-				newAddr, newCreds, err := p.resolveTURNAddr(linkID)
+				newAddr, newCreds, err := p.resolveTURNAddr(linkID, true)
 				if err != nil {
 					retries++
 					select {

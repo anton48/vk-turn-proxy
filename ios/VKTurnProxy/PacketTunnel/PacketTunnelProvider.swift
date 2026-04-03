@@ -6,6 +6,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private var tunnelHandle: Int32 = -1
     private let log = OSLog(subsystem: "com.vkturnproxy.tunnel", category: "PacketTunnel")
 
+    // Saved for deferred PHASE 2 (when captcha is pending at startup)
+    private var pendingTunnelAddress: String?
+    private var pendingDNS: String?
+    private var pendingMTU: String?
+    private var pendingExcludeHosts: [String] = []
+
     private func logMsg(_ msg: String) {
         os_log("%{public}s", log: log, type: .default, msg)
         NSLog("[PacketTunnel] %@", msg)
@@ -98,6 +104,22 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             self.tunnelHandle = handle
             self.logMsg("wgTurnOnWithTURN OK, handle=\(handle)")
 
+            // Check if captcha is pending — if so, skip PHASE 2 so the WebView
+            // can load the captcha page over the normal network (not through the
+            // non-functional VPN tunnel).
+            var captchaPending = false
+            if let statsPtr = wgGetStats(handle) {
+                let statsJSON = String(cString: statsPtr)
+                free(UnsafeMutableRawPointer(mutating: statsPtr))
+                if let data = statsJSON.data(using: .utf8),
+                   let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let captchaURL = dict["captcha_image_url"] as? String,
+                   !captchaURL.isEmpty {
+                    captchaPending = true
+                    self.logMsg("Captcha pending — deferring PHASE 2 (no routes until captcha solved)")
+                }
+            }
+
             // PHASE 2: Set final settings with default route and excluded routes
             // for TURN server and peer server IPs (so their traffic bypasses the tunnel).
             var excludeHosts: [String] = []
@@ -116,6 +138,17 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 }
             } else {
                 self.logMsg("WARNING: wgGetTURNServerIP returned nil")
+            }
+
+            if captchaPending {
+                // Save settings for later when captcha is solved
+                self.pendingTunnelAddress = tunnelAddress
+                self.pendingDNS = dnsServers
+                self.pendingMTU = mtu
+                self.pendingExcludeHosts = excludeHosts
+                self.logMsg("PHASE 2 deferred — tunnel started without routes")
+                completionHandler(nil)
+                return
             }
 
             self.logMsg("PHASE 2: excludeHosts=\(excludeHosts)")
@@ -159,6 +192,20 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             } else {
                 completionHandler?(nil)
             }
+        } else if msg.hasPrefix("solve_captcha:") {
+            let answer = String(msg.dropFirst("solve_captcha:".count))
+            logMsg("handleAppMessage: captcha answer received (\(answer.count) chars)")
+            if tunnelHandle >= 0 {
+                answer.withCString { ptr in
+                    wgSolveCaptcha(tunnelHandle, UnsafeMutablePointer(mutating: ptr))
+                }
+            }
+            completionHandler?("ok".data(using: .utf8))
+        } else if msg == "apply_routes" {
+            logMsg("handleAppMessage: apply_routes — applying deferred PHASE 2")
+            applyDeferredRoutes { success in
+                completionHandler?(success ? "ok".data(using: .utf8) : nil)
+            }
         } else {
             completionHandler?(nil)
         }
@@ -185,6 +232,49 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             tunnelHandle = -1
         }
         completionHandler()
+    }
+
+    // MARK: - Deferred Route Application
+
+    private func applyDeferredRoutes(completion: @escaping (Bool) -> Void) {
+        guard let address = pendingTunnelAddress,
+              let dns = pendingDNS,
+              let mtu = pendingMTU else {
+            logMsg("applyDeferredRoutes: no pending settings")
+            completion(false)
+            return
+        }
+
+        // Re-check TURN server IP (may have been resolved after captcha)
+        var excludeHosts = pendingExcludeHosts
+        if let turnIPPtr = wgGetTURNServerIP(tunnelHandle) {
+            let turnIP = String(cString: turnIPPtr)
+            free(UnsafeMutableRawPointer(mutating: turnIPPtr))
+            if !turnIP.isEmpty && !excludeHosts.contains(turnIP) {
+                excludeHosts.append(turnIP)
+                logMsg("applyDeferredRoutes: added TURN IP=\(turnIP)")
+            }
+        }
+
+        let finalSettings = createTunnelSettings(
+            address: address,
+            dns: dns,
+            mtu: mtu,
+            captureTraffic: true,
+            excludeHosts: excludeHosts
+        )
+
+        logMsg("applyDeferredRoutes: excludeHosts=\(excludeHosts)")
+        setTunnelNetworkSettings(finalSettings) { [weak self] error in
+            if let error = error {
+                self?.logMsg("applyDeferredRoutes ERROR: \(error)")
+                completion(false)
+            } else {
+                self?.logMsg("applyDeferredRoutes: routes applied OK — tunnel fully active")
+                self?.pendingTunnelAddress = nil
+                completion(true)
+            }
+        }
     }
 
     // MARK: - Network Settings

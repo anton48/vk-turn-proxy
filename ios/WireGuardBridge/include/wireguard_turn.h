@@ -40,6 +40,9 @@ void wgPause(int32_t tunnelHandle);
 /// Resume proxy connections (call from wake()).
 void wgResume(int32_t tunnelHandle);
 
+/// Provide captcha answer to unblock pending credential fetch.
+void wgSolveCaptcha(int32_t tunnelHandle, const char *answer);
+
 /// Get library version.
 /// @return Version string
 const char *wgVersion(void);

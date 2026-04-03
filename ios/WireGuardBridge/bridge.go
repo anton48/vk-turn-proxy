@@ -3,6 +3,7 @@ package main
 /*
 #include <stdint.h>
 #include <stdlib.h>
+#include <os/log.h>
 
 // Set GODEBUG=asyncpreemptoff=1 BEFORE Go runtime initializes.
 // This prevents "fatal error: non-Go code disabled sigaltstack"
@@ -17,6 +18,12 @@ typedef void(*logger_fn_t)(int level, const char *msg);
 static void callLogger(void *fn, int level, const char *msg) {
 	((logger_fn_t)fn)(level, msg);
 }
+
+// Write Go log messages to os_log (visible in Console.app)
+static void go_os_log(const char *msg) {
+	os_log_t log = os_log_create("com.vkturnproxy.tunnel", "go");
+	os_log(log, "%{public}s", msg);
+}
 */
 import "C"
 
@@ -24,6 +31,7 @@ import (
 	"encoding/json"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"unsafe"
 
@@ -248,6 +256,22 @@ func wgResume(tunnelHandle C.int32_t) {
 	entry.proxy.Resume()
 }
 
+//export wgSolveCaptcha
+func wgSolveCaptcha(tunnelHandle C.int32_t, answer *C.char) {
+	id := int32(tunnelHandle)
+	tunnelsMu.Lock()
+	entry, ok := tunnels[id]
+	tunnelsMu.Unlock()
+
+	if !ok {
+		return
+	}
+
+	goAnswer := C.GoString(answer)
+	log.Printf("wgSolveCaptcha: tunnel %d, answer length=%d", id, len(goAnswer))
+	entry.proxy.SolveCaptcha(goAnswer)
+}
+
 //export wgVersion
 func wgVersion() *C.char {
 	return C.CString("0.1.0-turn")
@@ -276,9 +300,22 @@ func dupFD(fd int) (int, error) {
 	return unix.Dup(fd)
 }
 
+// osLogWriter writes Go log output to os_log (visible in Console.app).
+type osLogWriter struct{}
+
+func (osLogWriter) Write(p []byte) (int, error) {
+	msg := C.CString(strings.TrimRight(string(p), "\n"))
+	defer C.free(unsafe.Pointer(msg))
+	C.go_os_log(msg)
+	return len(p), nil
+}
+
 func init() {
 	// Belt-and-suspenders: also set via Go in case C constructor didn't run first
 	os.Setenv("GODEBUG", "asyncpreemptoff=1")
+	// Route all Go logs to os_log so they show in Console.app
+	log.SetOutput(osLogWriter{})
+	log.SetFlags(log.Ltime | log.Lmicroseconds)
 }
 
 func main() {}

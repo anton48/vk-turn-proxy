@@ -12,3 +12,4 @@ vendor/
 
 # macOS
 .DS_Store
+keys/

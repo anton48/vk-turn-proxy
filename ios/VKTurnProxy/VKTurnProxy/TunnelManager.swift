@@ -13,6 +13,8 @@ struct TunnelStats: Codable {
     var turnRTTms: Double = 0
     var dtlsHandshakeMs: Double = 0
     var reconnects: Int64 = 0
+    var captchaImageURL: String?
+    var captchaSID: String?
 
     enum CodingKeys: String, CodingKey {
         case txBytes = "tx_bytes"
@@ -22,6 +24,8 @@ struct TunnelStats: Codable {
         case turnRTTms = "turn_rtt_ms"
         case dtlsHandshakeMs = "dtls_handshake_ms"
         case reconnects
+        case captchaImageURL = "captcha_image_url"
+        case captchaSID = "captcha_sid"
     }
 }
 
@@ -43,6 +47,9 @@ class TunnelManager: ObservableObject {
     @Published var txRate: Double = 0  // bytes/sec
     @Published var rxRate: Double = 0  // bytes/sec
     @Published var internetRTTms: Double = 0  // ms, TCP connect to 1.1.1.1
+    @Published var captchaPending = false
+    @Published var captchaImageURL: String?
+    @Published var captchaSID: String?
 
     init() {
         Task {
@@ -104,6 +111,30 @@ class TunnelManager: ObservableObject {
 
     func disconnect() {
         manager?.connection.stopVPNTunnel()
+    }
+
+    func applyDeferredRoutes() {
+        guard let session = manager?.connection as? NETunnelProviderSession else { return }
+        guard let msg = "apply_routes".data(using: .utf8) else { return }
+        do {
+            try session.sendProviderMessage(msg) { _ in }
+        } catch {
+            // Extension might not be running
+        }
+    }
+
+    func solveCaptcha(answer: String) {
+        guard let session = manager?.connection as? NETunnelProviderSession else { return }
+        guard let msg = "solve_captcha:\(answer)".data(using: .utf8) else { return }
+        do {
+            try session.sendProviderMessage(msg) { _ in
+                // Don't clear captchaPending here — let the stats polling
+                // detect the transition (captcha_image_url becomes empty)
+                // and trigger applyDeferredRoutes().
+            }
+        } catch {
+            // Extension might not be running
+        }
     }
 
     // MARK: - Private
@@ -201,6 +232,23 @@ class TunnelManager: ObservableObject {
                         self.prevRx = newStats.rxBytes
                         self.prevTime = now
                         self.stats = newStats
+
+                        // Detect captcha
+                        if let url = newStats.captchaImageURL, !url.isEmpty {
+                            if !self.captchaPending {
+                                self.captchaPending = true
+                                self.captchaImageURL = url
+                                self.captchaSID = newStats.captchaSID
+                            }
+                        } else {
+                            if self.captchaPending {
+                                // Captcha was pending but is now cleared — apply routes
+                                self.captchaPending = false
+                                self.captchaImageURL = nil
+                                self.captchaSID = nil
+                                self.applyDeferredRoutes()
+                            }
+                        }
                     }
                 }
             }
@@ -325,7 +373,7 @@ struct TunnelConfig {
     var peerAddress: String = ""  // vk-turn-proxy server host:port
     var useDTLS: Bool = true
     var useUDP: Bool = true
-    var numConnections: Int = 16 // configurable from Settings
+    var numConnections: Int = 10 // configurable from Settings (VK allows max ~10 allocations)
     var turnServerOverride: String?
     var turnPortOverride: String?
 }
