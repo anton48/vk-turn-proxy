@@ -43,6 +43,14 @@ void wgResume(int32_t tunnelHandle);
 /// Provide captcha answer to unblock pending credential fetch.
 void wgSolveCaptcha(int32_t tunnelHandle, const char *answer);
 
+/// Set the path to the shared log file (App Group container).
+/// Go log output will be appended to this file in addition to os_log.
+void wgSetLogFilePath(const char *path);
+
+/// Set timezone offset in seconds (e.g. 10800 for UTC+3).
+/// Go runtime on iOS has no tzdata, so this aligns Go log timestamps with local time.
+void wgSetTimezoneOffset(int offsetSeconds);
+
 /// Get library version.
 /// @return Version string
 const char *wgVersion(void);

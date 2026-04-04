@@ -50,6 +50,7 @@ class TunnelManager: ObservableObject {
     @Published var captchaPending = false
     @Published var captchaImageURL: String?
     @Published var captchaSID: String?
+    private var dnsSuspended = false  // true when routes removed for reconnect captcha
 
     init() {
         Task {
@@ -121,6 +122,26 @@ class TunnelManager: ObservableObject {
         } catch {
             // Extension might not be running
         }
+    }
+
+    /// Temporarily remove VPN DNS settings so system uses provider DNS (cellular/WiFi).
+    /// Called when captcha is needed during reconnection (tunnel is dead, DNS to 1.1.1.1
+    /// through TUN would fail, preventing WebView from resolving VK hostnames).
+    func suspendDNS() {
+        guard let session = manager?.connection as? NETunnelProviderSession else { return }
+        guard let msg = "suspend_dns".data(using: .utf8) else { return }
+        do {
+            try session.sendProviderMessage(msg) { _ in }
+        } catch {}
+    }
+
+    /// Restore VPN DNS settings after captcha is solved.
+    func restoreDNS() {
+        guard let session = manager?.connection as? NETunnelProviderSession else { return }
+        guard let msg = "restore_dns".data(using: .utf8) else { return }
+        do {
+            try session.sendProviderMessage(msg) { _ in }
+        } catch {}
     }
 
     func solveCaptcha(answer: String) {
@@ -239,14 +260,27 @@ class TunnelManager: ObservableObject {
                                 self.captchaPending = true
                                 self.captchaImageURL = url
                                 self.captchaSID = newStats.captchaSID
+                                // If tunnel was already connected (reconnect captcha),
+                                // suspend routes so WebView can load captcha page directly.
+                                // Without this, DNS and HTTP go through the dead tunnel.
+                                if self.status == .connected {
+                                    self.suspendDNS()
+                                    self.dnsSuspended = true
+                                }
                             }
                         } else {
                             if self.captchaPending {
-                                // Captcha was pending but is now cleared — apply routes
                                 self.captchaPending = false
                                 self.captchaImageURL = nil
                                 self.captchaSID = nil
-                                self.applyDeferredRoutes()
+                                if self.dnsSuspended {
+                                    // Captcha solved during reconnect — restore VPN DNS
+                                    self.restoreDNS()
+                                    self.dnsSuspended = false
+                                } else {
+                                    // Captcha solved during initial startup — apply deferred routes
+                                    self.applyDeferredRoutes()
+                                }
                             }
                         }
                     }

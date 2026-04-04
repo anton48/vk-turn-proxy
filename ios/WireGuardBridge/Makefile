@@ -11,6 +11,9 @@ export CGO_ENABLED := 1
 export GOARCH := arm64
 
 GO_BUILD_FLAGS := -buildmode=c-archive -trimpath -tags ios
+export GONOSUMCHECK := *
+export GONOSUMDB := *
+export GOFLAGS := -mod=mod
 GO_LDFLAGS := -s -w
 
 # Patched GOROOT: replaces mach_absolute_time with mach_continuous_time

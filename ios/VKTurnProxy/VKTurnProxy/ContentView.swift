@@ -83,9 +83,14 @@ struct ContentView: View {
                 }
                 .padding(.horizontal)
 
-                // Settings link
-                NavigationLink(destination: SettingsView()) {
-                    Label("Settings", systemImage: "gear")
+                // Logs & Settings links
+                HStack(spacing: 24) {
+                    NavigationLink(destination: LogsView()) {
+                        Label("Logs", systemImage: "doc.text")
+                    }
+                    NavigationLink(destination: SettingsView()) {
+                        Label("Settings", systemImage: "gear")
+                    }
                 }
                 .padding(.bottom, 24)
             }
@@ -441,6 +446,111 @@ struct CaptchaWKWebView: UIViewRepresentable {
             log("Loaded: \(String((webView.url?.absoluteString ?? "nil").prefix(150)))")
         }
     }
+}
+
+// MARK: - Logs View
+
+struct LogsView: View {
+    @State private var logText = ""
+    @State private var autoScroll = true
+    @State private var showShareSheet = false
+    private let timer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
+
+    /// Maximum characters to display — keeps UI responsive.
+    /// The full file is still available via Share.
+    private let maxDisplayChars = 100_000
+
+    var body: some View {
+        VStack(spacing: 0) {
+            LogTextView(text: logText, autoScroll: autoScroll)
+
+            Divider()
+
+            HStack {
+                Toggle("Auto-scroll", isOn: $autoScroll)
+                    .font(.caption)
+                    .toggleStyle(.switch)
+                    .fixedSize()
+
+                Spacer()
+
+                Button(action: {
+                    SharedLogger.shared.clearLogs()
+                    logText = ""
+                }) {
+                    Label("Clear", systemImage: "trash")
+                        .font(.caption)
+                }
+
+                Button(action: { showShareSheet = true }) {
+                    Label("Share", systemImage: "square.and.arrow.up")
+                        .font(.caption)
+                }
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 8)
+        }
+        .navigationTitle("Logs")
+        .onAppear { loadLogs() }
+        .onReceive(timer) { _ in loadLogs() }
+        .sheet(isPresented: $showShareSheet) {
+            if let url = SharedLogger.shared.logFileURL,
+               FileManager.default.fileExists(atPath: url.path) {
+                ShareSheet(activityItems: [url])
+            }
+        }
+    }
+
+    private func loadLogs() {
+        var text = SharedLogger.shared.readLogs()
+        if text.isEmpty {
+            text = "No logs yet"
+        } else if text.count > maxDisplayChars {
+            // Show only the tail so the most recent logs are visible
+            let startIndex = text.index(text.endIndex, offsetBy: -maxDisplayChars)
+            text = "… (truncated)\n" + String(text[startIndex...])
+        }
+        logText = text
+    }
+}
+
+/// UITextView wrapper — handles large text without SwiftUI layout explosion.
+struct LogTextView: UIViewRepresentable {
+    let text: String
+    let autoScroll: Bool
+
+    func makeUIView(context: Context) -> UITextView {
+        let tv = UITextView()
+        tv.isEditable = false
+        tv.isSelectable = true
+        tv.font = UIFont.monospacedSystemFont(ofSize: 10, weight: .regular)
+        tv.textColor = .label
+        tv.backgroundColor = .systemBackground
+        tv.textContainerInset = UIEdgeInsets(top: 8, left: 4, bottom: 8, right: 4)
+        return tv
+    }
+
+    func updateUIView(_ tv: UITextView, context: Context) {
+        // Only update if text actually changed to avoid unnecessary work
+        if tv.text != text {
+            tv.text = text
+            if autoScroll && !text.isEmpty {
+                let bottom = NSRange(location: text.count - 1, length: 1)
+                tv.scrollRangeToVisible(bottom)
+            }
+        }
+    }
+}
+
+/// UIActivityViewController wrapper for sharing the log file.
+struct ShareSheet: UIViewControllerRepresentable {
+    let activityItems: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
 #Preview {

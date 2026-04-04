@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -12,8 +11,8 @@ import (
 	"io"
 	"log"
 	mathrand "math/rand"
-	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -21,10 +20,8 @@ import (
 	"time"
 )
 
-// captchaPowUA stores the User-Agent for the current PoW session.
-// Set by solveCaptchaPoW() caller — must match the UA used for the VK API
-// request that triggered the captcha (VK fingerprints UA mismatches).
-var captchaPowUA string
+// captchaPowProfile stores the browser profile for the current PoW session.
+var captchaPowProfile BrowserProfile
 
 func randomHex(n int) string {
 	b := make([]byte, n)
@@ -36,31 +33,30 @@ func randomHex(n int) string {
 	return hex.EncodeToString(b)
 }
 
-// newHTTPClient creates a fresh http.Client for each request.
-// Uses standard Go TLS (same as TurnBridge and Android fork, both confirmed working).
+// newSessionClient creates an HTTP client with a shared cookie jar and Chrome TLS fingerprint.
+func newSessionClient() *http.Client {
+	jar, _ := cookiejar.New(nil)
+	return &http.Client{
+		Timeout:   20 * time.Second,
+		Jar:       jar,
+		Transport: newChromeTransport(),
+	}
+}
+
+// newHTTPClient creates a fresh http.Client (no cookie jar) with Chrome TLS fingerprint.
 func newHTTPClient() *http.Client {
 	return &http.Client{
-		Timeout: 20 * time.Second,
-		Transport: &http.Transport{
-			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: false,
-			},
-		},
+		Timeout:   20 * time.Second,
+		Transport: newChromeTransport(),
 	}
 }
 
 // solveCaptchaPoW attempts to solve a VK "Not Robot" captcha automatically
 // using proof-of-work, without any user interaction.
 func solveCaptchaPoW(ctx context.Context, redirectURI, captchaSID, userAgent string) (string, error) {
-	// Use the same UA as the VK API request that triggered the captcha.
-	// VK ties the captcha session to the original request's fingerprint —
-	// using a different UA triggers BOT detection.
-	captchaPowUA = userAgent
-	log.Printf("pow: attempting automatic captcha solve (UA: %s)", captchaPowUA)
+	captchaPowProfile = profileForUA(userAgent)
+	log.Printf("pow: attempting automatic captcha solve (UA: %s, platform: %s, Chrome/%d)",
+		captchaPowProfile.UserAgent, captchaPowProfile.Platform, captchaPowProfile.ChromeVersion)
 
 	parsed, err := url.Parse(redirectURI)
 	if err != nil {
@@ -71,20 +67,34 @@ func solveCaptchaPoW(ctx context.Context, redirectURI, captchaSID, userAgent str
 		return "", fmt.Errorf("no session_token in redirect_uri")
 	}
 
-	// Random initial delay (1-2.5s) to look human-like
-	delay := time.Duration(1000+mathrand.Intn(1500)) * time.Millisecond
+	// Single HTTP client with cookie jar for the entire captcha session.
+	client := newSessionClient()
+	defer client.CloseIdleConnections()
+
+	// Random initial delay (1.5-2.5s) — HAR timing from real browser
+	delay := time.Duration(1500+mathrand.Intn(1000)) * time.Millisecond
 	select {
 	case <-time.After(delay):
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
 
-	// Step 1: Fetch captcha page and extract PoW parameters
-	powInput, difficulty, err := fetchPoW(ctx, redirectURI)
+	// Step 1: Fetch captcha page and extract PoW parameters + cookies
+	powInput, difficulty, err := fetchPoW(ctx, client, redirectURI)
 	if err != nil {
 		return "", fmt.Errorf("fetch PoW: %w", err)
 	}
 	log.Printf("pow: input=%s difficulty=%d", powInput, difficulty)
+
+	// Log cookies received from page load (for debugging)
+	if parsedURL, e := url.Parse("https://id.vk.ru"); e == nil {
+		cookies := client.Jar.Cookies(parsedURL)
+		log.Printf("pow: received %d cookies from page load", len(cookies))
+	}
+	if parsedURL, e := url.Parse("https://vk.ru"); e == nil {
+		cookies := client.Jar.Cookies(parsedURL)
+		log.Printf("pow: received %d cookies from vk.ru domain", len(cookies))
+	}
 
 	// Step 2: Solve PoW (brute-force SHA-256)
 	hash := solvePoW(powInput, difficulty)
@@ -96,8 +106,8 @@ func solveCaptchaPoW(ctx context.Context, redirectURI, captchaSID, userAgent str
 	// Brief pause after PoW (simulate browser JS execution time)
 	time.Sleep(time.Duration(200+mathrand.Intn(300)) * time.Millisecond)
 
-	// Step 3: Call captchaNotRobot API sequence
-	successToken, err := callCaptchaNotRobotAPI(ctx, sessionToken, hash)
+	// Step 3: Call captchaNotRobot API sequence (using same client = same cookies)
+	successToken, err := callCaptchaNotRobotAPI(ctx, client, sessionToken, hash)
 	if err != nil {
 		return "", fmt.Errorf("captchaNotRobot API: %w", err)
 	}
@@ -107,16 +117,24 @@ func solveCaptchaPoW(ctx context.Context, redirectURI, captchaSID, userAgent str
 }
 
 // fetchPoW fetches the captcha HTML page and extracts PoW parameters.
-func fetchPoW(ctx context.Context, redirectURI string) (powInput string, difficulty int, err error) {
+func fetchPoW(ctx context.Context, client *http.Client, redirectURI string) (powInput string, difficulty int, err error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", redirectURI, nil)
 	if err != nil {
 		return "", 0, err
 	}
-	req.Header.Set("User-Agent", captchaPowUA)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("User-Agent", captchaPowProfile.UserAgent)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9,ru;q=0.8")
+	req.Header.Set("sec-ch-ua", captchaPowProfile.SecChUA())
+	req.Header.Set("sec-ch-ua-mobile", "?0")
+	req.Header.Set("sec-ch-ua-platform", captchaPowProfile.SecChUAPlatform())
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Site", "none")
+	req.Header.Set("Sec-Fetch-User", "?1")
+	req.Header.Set("Upgrade-Insecure-Requests", "1")
+	req.Header.Set("DNT", "1")
 
-	client := newHTTPClient()
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", 0, fmt.Errorf("HTTP GET failed: %w", err)
@@ -134,7 +152,6 @@ func fetchPoW(ctx context.Context, redirectURI string) (powInput string, difficu
 	powRe := regexp.MustCompile(`const\s+powInput\s*=\s*"([^"]+)"`)
 	m := powRe.FindStringSubmatch(html)
 	if len(m) < 2 {
-		// Log first 500 chars of HTML for debugging
 		preview := html
 		if len(preview) > 500 {
 			preview = preview[:500]
@@ -172,30 +189,30 @@ func solvePoW(powInput string, difficulty int) string {
 }
 
 // callCaptchaNotRobotAPI performs the 4-step VK captchaNotRobot protocol.
-func callCaptchaNotRobotAPI(ctx context.Context, sessionToken, hash string) (string, error) {
-	// Each API call uses a fresh http.Client (matching TurnBridge's behavior)
+// Adapted from the reference implementation in PR #105 — uses simplified
+// sensor data (empty arrays) and longer timing delays.
+func callCaptchaNotRobotAPI(ctx context.Context, client *http.Client, sessionToken, hash string) (string, error) {
 	vkReq := func(method, postData string) (map[string]interface{}, error) {
 		reqURL := "https://api.vk.ru/method/" + method + "?v=5.131"
 		req, err := http.NewRequestWithContext(ctx, "POST", reqURL, strings.NewReader(postData))
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("User-Agent", captchaPowUA)
+		req.Header.Set("User-Agent", captchaPowProfile.UserAgent)
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req.Header.Set("Accept", "*/*")
-		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-		req.Header.Set("Origin", "https://vk.ru")
-		req.Header.Set("Referer", "https://vk.ru/")
-		req.Header.Set("sec-ch-ua-platform", `"Linux"`)
-		req.Header.Set("sec-ch-ua", `"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"`)
+		req.Header.Set("Accept-Language", "en-US,en;q=0.9,ru;q=0.8")
+		req.Header.Set("Origin", "https://id.vk.ru")
+		req.Header.Set("Referer", "https://id.vk.ru/")
+		req.Header.Set("sec-ch-ua", captchaPowProfile.SecChUA())
 		req.Header.Set("sec-ch-ua-mobile", "?0")
+		req.Header.Set("sec-ch-ua-platform", captchaPowProfile.SecChUAPlatform())
 		req.Header.Set("DNT", "1")
 		req.Header.Set("Sec-Fetch-Site", "same-site")
 		req.Header.Set("Sec-Fetch-Mode", "cors")
 		req.Header.Set("Sec-Fetch-Dest", "empty")
 		req.Header.Set("Sec-GPC", "1")
 
-		client := newHTTPClient()
 		httpResp, err := client.Do(req)
 		if err != nil {
 			return nil, fmt.Errorf("HTTP POST %s failed: %w", method, err)
@@ -226,34 +243,30 @@ func callCaptchaNotRobotAPI(ctx context.Context, sessionToken, hash string) (str
 	if err != nil {
 		return "", fmt.Errorf("settings: %w", err)
 	}
-	time.Sleep(200 * time.Millisecond)
 
-	// 2/4: componentDone — send fake desktop browser fingerprint
+	// Short delay after settings (100-200ms) — matches reference impl
+	time.Sleep(time.Duration(100+mathrand.Intn(100)) * time.Millisecond)
+
+	// 2/4: componentDone
 	log.Printf("pow: 2/4 captchaNotRobot.componentDone")
-	browserFp := randomHex(16)
+	browserFp := fmt.Sprintf("%x%x", mathrand.Int63(), mathrand.Int63())
 
-	resolutions := [][]int{{1920, 1080}, {1366, 768}, {1440, 900}, {1536, 864}, {2560, 1440}}
-	res := resolutions[mathrand.Intn(len(resolutions))]
-	screenW, screenH := res[0], res[1]
-
-	cores := []int{4, 8, 12, 16}[mathrand.Intn(4)]
-	ram := []int{4, 8, 16, 32}[mathrand.Intn(4)]
-
+	// Simplified device data matching reference implementation
 	deviceMap := map[string]interface{}{
-		"screenWidth":             screenW,
-		"screenHeight":            screenH,
-		"screenAvailWidth":        screenW,
-		"screenAvailHeight":       screenH - 40,
-		"innerWidth":              screenW - mathrand.Intn(100),
-		"innerHeight":             screenH - 100 - mathrand.Intn(50),
-		"devicePixelRatio":        []float64{1, 1.25, 1.5, 2}[mathrand.Intn(4)],
+		"screenWidth":             1920,
+		"screenHeight":            1080,
+		"screenAvailWidth":        1920,
+		"screenAvailHeight":       1040,
+		"innerWidth":              1903,
+		"innerHeight":             969,
+		"devicePixelRatio":        1,
 		"language":                "en-US",
-		"languages":               []string{"en-US", "en"},
+		"languages":               []string{"en-US", "en", "ru"},
 		"webdriver":               false,
-		"hardwareConcurrency":     cores,
-		"deviceMemory":            ram,
+		"hardwareConcurrency":     8,
+		"deviceMemory":            8,
 		"connectionEffectiveType": "4g",
-		"notificationsPermission": "denied",
+		"notificationsPermission": "default",
 	}
 	deviceBytes, _ := json.Marshal(deviceMap)
 
@@ -264,32 +277,44 @@ func callCaptchaNotRobotAPI(ctx context.Context, sessionToken, hash string) (str
 	if err != nil {
 		return "", fmt.Errorf("componentDone: %w", err)
 	}
-	time.Sleep(200 * time.Millisecond)
 
-	// 3/4: check — send PoW hash + fake telemetry
+	// Longer pause before check (1950-3200ms) — matches reference HAR timing
+	checkDelay := time.Duration(1950+mathrand.Intn(1250)) * time.Millisecond
+	log.Printf("pow: waiting %s before check", checkDelay.Round(time.Millisecond))
+	select {
+	case <-time.After(checkDelay):
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+
+	// 3/4: check
 	log.Printf("pow: 3/4 captchaNotRobot.check")
 
-	type Point struct {
-		X int `json:"x"`
-		Y int `json:"y"`
+	// Simplified sensor data — empty arrays for most sensors,
+	// minimal cursor path. Reference impl shows VK accepts this
+	// and overly-detailed fake data may trigger detection.
+	now := time.Now().UnixMilli()
+	cursorData := []map[string]interface{}{
+		{"x": 960, "y": 540, "t": now - 2000},
+		{"x": 965, "y": 538, "t": now - 1500},
+		{"x": 970, "y": 535, "t": now - 1000},
+		{"x": 972, "y": 533, "t": now - 500},
+		{"x": 975, "y": 530, "t": now},
 	}
-	var cursor []Point
-	cx, cy := screenW/2+mathrand.Intn(200)-100, screenH/2+mathrand.Intn(200)-100
-	for i := 0; i < 4+mathrand.Intn(5); i++ {
-		cursor = append(cursor, Point{X: cx, Y: cy})
-		cx += mathrand.Intn(30) - 15
-		cy += mathrand.Intn(30) - 15
-	}
-	cursorBytes, _ := json.Marshal(cursor)
+	cursorBytes, _ := json.Marshal(cursorData)
 
+	// Downlink: small array with realistic values
 	var downlink []float64
-	baseSpeed := float64(mathrand.Intn(8) + 2)
-	for i := 0; i < 16; i++ {
-		downlink = append(downlink, baseSpeed)
+	baseSpeed := 8.0 + mathrand.Float64()*4.0
+	for i := 0; i < 7; i++ {
+		downlink = append(downlink, baseSpeed+mathrand.Float64()*0.5-0.25)
 	}
 	downlinkBytes, _ := json.Marshal(downlink)
 
 	answer := base64.StdEncoding.EncodeToString([]byte("{}"))
+
+	// Fixed debug_info hash — a real browser sends consistent value
+	debugInfo := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 	checkData := baseParams + fmt.Sprintf(
 		"&accelerometer=%s&gyroscope=%s&motion=%s&cursor=%s&taps=%s&connectionRtt=%s&connectionDownlink=%s"+
@@ -304,7 +329,7 @@ func callCaptchaNotRobotAPI(ctx context.Context, sessionToken, hash string) (str
 		browserFp,
 		hash,
 		answer,
-		randomHex(32),
+		debugInfo,
 	)
 
 	checkResp, err := vkReq("captchaNotRobot.check", checkData)

@@ -29,10 +29,12 @@ import "C"
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"strings"
 	"sync"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -300,22 +302,86 @@ func dupFD(fd int) (int, error) {
 	return unix.Dup(fd)
 }
 
-// osLogWriter writes Go log output to os_log (visible in Console.app).
+// --- Shared log file support (fully async, zero impact on caller timing) ---
+
+var (
+	logFileMu   sync.Mutex
+	logFilePath string
+	logChan     chan string
+)
+
+func startLogWriter() {
+	logChan = make(chan string, 512)
+	go func() {
+		for line := range logChan {
+			logFileMu.Lock()
+			p := logFilePath
+			logFileMu.Unlock()
+			if p == "" {
+				continue
+			}
+			f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if err != nil {
+				continue
+			}
+			f.WriteString(line)
+			f.Close()
+		}
+	}()
+}
+
+//export wgSetLogFilePath
+func wgSetLogFilePath(path *C.char) {
+	p := C.GoString(path)
+	logFileMu.Lock()
+	logFilePath = p
+	logFileMu.Unlock()
+	log.Printf("wgSetLogFilePath: %s", p)
+}
+
+// osLogWriter writes Go log output to os_log (visible in Console.app)
+// AND queues it to the async file writer (zero blocking on caller).
 type osLogWriter struct{}
 
 func (osLogWriter) Write(p []byte) (int, error) {
-	msg := C.CString(strings.TrimRight(string(p), "\n"))
+	s := strings.TrimRight(string(p), "\n")
+	msg := C.CString(s)
 	defer C.free(unsafe.Pointer(msg))
 	C.go_os_log(msg)
+	// Build timestamped line using local timezone (set via wgSetTimezoneOffset)
+	now := time.Now()
+	if goTZ != nil {
+		now = now.In(goTZ)
+	}
+	ts := now.Format("15:04:05.000000")
+	line := fmt.Sprintf("[Go] %s %s\n", ts, s)
+	// Non-blocking send to async writer; drop if buffer full (never block caller)
+	select {
+	case logChan <- line:
+	default:
+	}
 	return len(p), nil
+}
+
+// goTZ holds the local timezone offset set from Swift (iOS Go runtime lacks tzdata).
+var goTZ *time.Location
+
+//export wgSetTimezoneOffset
+func wgSetTimezoneOffset(offsetSeconds C.int) {
+	off := int(offsetSeconds)
+	goTZ = time.FixedZone(fmt.Sprintf("UTC%+d", off/3600), off)
+	log.Printf("timezone set to %s (offset %ds)", goTZ, off)
 }
 
 func init() {
 	// Belt-and-suspenders: also set via Go in case C constructor didn't run first
 	os.Setenv("GODEBUG", "asyncpreemptoff=1")
+	// Start async log file writer
+	startLogWriter()
 	// Route all Go logs to os_log so they show in Console.app
 	log.SetOutput(osLogWriter{})
-	log.SetFlags(log.Ltime | log.Lmicroseconds)
+	// Use no flags — we add our own timestamp with local timezone in osLogWriter
+	log.SetFlags(0)
 }
 
 func main() {}

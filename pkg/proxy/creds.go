@@ -55,14 +55,7 @@ func GetVKCreds(linkID string, captchaSolver CaptchaSolver, solvedCaptchaSID, so
 	log.Printf("vk: identity — name: %s, UA: %s", name, ua)
 
 	doRequest := func(data string, url string) (resp map[string]interface{}, err error) {
-		client := &http.Client{
-			Timeout: 20 * time.Second,
-			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 100,
-				IdleConnTimeout:     90 * time.Second,
-			},
-		}
+		client := newHTTPClient()
 		defer client.CloseIdleConnections()
 		req, err := http.NewRequest("POST", url, bytes.NewBuffer([]byte(data)))
 		if err != nil {
@@ -151,34 +144,72 @@ func GetVKCreds(linkID string, captchaSolver CaptchaSolver, solvedCaptchaSID, so
 		if captchaSID != "" {
 			log.Printf("vk: captcha required (attempt %d), url: %s", attempt+1, captchaImg)
 
-			// Try automatic PoW solver first (no user interaction needed).
-			// This works even during phone sleep since it runs in the Network Extension.
-			powCtx, powCancel := context.WithTimeout(context.Background(), 30*time.Second)
-			powToken, powErr := solveCaptchaPoW(powCtx, captchaImg, captchaSID, ua)
-			powCancel()
+			// Try automatic PoW solver up to 3 times with fresh captcha sessions.
+			// VK's BOT detection is probabilistic — retrying significantly increases success rate.
+			const maxPoWRetries = 3
+			powSolved := false
+			currentImg := captchaImg
+			currentSID := captchaSID
+			currentTs := captchaTs
+			currentAttempt := captchaAttempt
 
-			if powErr == nil && powToken != "" {
-				log.Printf("vk: PoW auto-solve succeeded (%d chars), retrying step2", len(powToken))
-				step2Data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s&captcha_key=&captcha_sid=%s&is_sound_captcha=0&success_token=%s&captcha_ts=%.3f&captcha_attempt=%d",
-					linkID, escapedName, token1, captchaSID, neturl.QueryEscape(powToken), captchaTs, int(captchaAttempt))
+			for powTry := 1; powTry <= maxPoWRetries; powTry++ {
+				log.Printf("vk: PoW attempt %d/%d", powTry, maxPoWRetries)
+				powCtx, powCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				powToken, powErr := solveCaptchaPoW(powCtx, currentImg, currentSID, ua)
+				powCancel()
+
+				if powErr == nil && powToken != "" {
+					log.Printf("vk: PoW auto-solve succeeded on attempt %d (%d chars), retrying step2", powTry, len(powToken))
+					step2Data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s&captcha_key=&captcha_sid=%s&is_sound_captcha=0&success_token=%s&captcha_ts=%.3f&captcha_attempt=%d",
+						linkID, escapedName, token1, currentSID, neturl.QueryEscape(powToken), currentTs, int(currentAttempt))
+					powSolved = true
+					break
+				}
+
+				log.Printf("vk: PoW attempt %d/%d failed: %v", powTry, maxPoWRetries, powErr)
+
+				if powTry < maxPoWRetries {
+					// Get a fresh captcha session for the next PoW attempt
+					// (the failed session_token is burned)
+					freshData := fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s", linkID, escapedName, token1)
+					freshResp, freshErr := doRequest(freshData, step2URL)
+					if freshErr != nil {
+						log.Printf("vk: failed to get fresh captcha for PoW retry: %v", freshErr)
+						break
+					}
+					fSID, fImg, fTs, fAttempt := extractCaptcha(freshResp)
+					if fSID == "" {
+						// No captcha this time — maybe VK accepted us
+						token2, err = extractStr(freshResp, "response", "token")
+						if err == nil {
+							powSolved = true // not exactly PoW, but we got the token
+						}
+						break
+					}
+					currentSID = fSID
+					currentImg = fImg
+					currentTs = fTs
+					currentAttempt = fAttempt
+					log.Printf("vk: got fresh captcha for PoW retry %d/%d", powTry+1, maxPoWRetries)
+				}
+			}
+
+			if powSolved {
 				continue
 			}
 
-			// PoW failed — the session_token is burned (VK counts the failed attempt).
-			// Do NOT try WebView with the same token — it will show "Attempt limit reached".
-			// Instead, let the outer retry loop re-request step2 to get a fresh captcha.
-			log.Printf("vk: PoW auto-solve failed: %v — requesting fresh captcha for WebView", powErr)
+			// All PoW attempts exhausted — fall back to WebView
+			log.Printf("vk: all %d PoW attempts failed, falling back to WebView", maxPoWRetries)
 
-			// Re-request step2 WITHOUT captcha params to get a fresh captcha session
+			// Re-request step2 for a fresh captcha session for WebView
 			step2Data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s", linkID, escapedName, token1)
 			resp, err = doRequest(step2Data, step2URL)
 			if err != nil {
 				return nil, fmt.Errorf("step2 re-request: %w", err)
 			}
-			// Extract fresh captcha from the new response
 			freshSID, freshImg, freshTs, freshAttempt := extractCaptcha(resp)
 			if freshSID == "" {
-				// No captcha this time — maybe VK accepted us?
 				token2, err = extractStr(resp, "response", "token")
 				if err != nil {
 					return nil, fmt.Errorf("step2 parse after fresh: %w", err)
@@ -186,7 +217,6 @@ func GetVKCreds(linkID string, captchaSolver CaptchaSolver, solvedCaptchaSID, so
 				break
 			}
 
-			// Fall back to WebView with fresh captcha session
 			if captchaSolver == nil {
 				return nil, &CaptchaRequiredError{ImageURL: freshImg, SID: freshSID, CaptchaTs: freshTs, CaptchaAttempt: freshAttempt, Token1: token1}
 			}

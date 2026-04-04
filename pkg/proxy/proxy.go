@@ -84,7 +84,8 @@ type Proxy struct {
 
 	// Cached TURN credentials: shared across all connections so only one
 	// GetVKCreds call is needed (avoids per-connection captcha).
-	cachedCredsMu   sync.Mutex
+	cachedCredsMu   sync.Mutex // protects read/write of cached creds
+	credsFetchMu    sync.Mutex // serializes GetVKCreds calls (may block on captcha)
 	cachedTURNAddr  string
 	cachedCreds     *TURNCreds
 	cachedCredsTime time.Time
@@ -537,12 +538,12 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 }
 
 // resolveTURNAddr fetches VK credentials and resolves the TURN server address.
-// Uses cached credentials if available (< 60s old) to avoid per-connection captcha.
-// Serializes VK API calls: if one goroutine is fetching creds, others wait for the result.
+// Uses cached credentials if available (< 5min old) to avoid per-connection captcha.
+// Serializes VK API calls via credsFetchMu so only one goroutine fetches at a time.
 // If allowCaptchaBlock is false, captcha returns an error instead of blocking.
 func (p *Proxy) resolveTURNAddr(linkID string, allowCaptchaBlock bool) (string, *TURNCreds, error) {
+	// Fast path: check cache (read lock)
 	p.cachedCredsMu.Lock()
-	// Check cache under lock — if fresh, return immediately
 	if p.cachedCreds != nil && time.Since(p.cachedCredsTime) < 5*time.Minute {
 		addr := p.cachedTURNAddr
 		creds := p.cachedCreds
@@ -550,9 +551,24 @@ func (p *Proxy) resolveTURNAddr(linkID string, allowCaptchaBlock bool) (string, 
 		log.Printf("proxy: using cached TURN creds (age %s)", time.Since(p.cachedCredsTime).Round(time.Second))
 		return addr, creds, nil
 	}
-	// Hold lock while fetching — other goroutines will block on cachedCredsMu.Lock()
-	// and then find the cache populated. This prevents 10 parallel GetVKCreds calls.
-	defer p.cachedCredsMu.Unlock()
+	p.cachedCredsMu.Unlock()
+
+	// Slow path: serialize credential fetching so only one goroutine calls GetVKCreds.
+	// cachedCredsMu is NOT held during fetch — this avoids blocking all goroutines
+	// when the solver waits for the user to solve captcha (which can take minutes).
+	p.credsFetchMu.Lock()
+	defer p.credsFetchMu.Unlock()
+
+	// Re-check cache — another goroutine may have populated it while we waited.
+	p.cachedCredsMu.Lock()
+	if p.cachedCreds != nil && time.Since(p.cachedCredsTime) < 5*time.Minute {
+		addr := p.cachedTURNAddr
+		creds := p.cachedCreds
+		p.cachedCredsMu.Unlock()
+		log.Printf("proxy: using cached TURN creds (age %s)", time.Since(p.cachedCredsTime).Round(time.Second))
+		return addr, creds, nil
+	}
+	p.cachedCredsMu.Unlock()
 
 	var solver CaptchaSolver
 	if allowCaptchaBlock {
@@ -605,9 +621,11 @@ func (p *Proxy) resolveTURNAddr(linkID string, allowCaptchaBlock bool) (string, 
 	addr := net.JoinHostPort(turnHost, turnPort)
 
 	// Cache the credentials for other connections to reuse
+	p.cachedCredsMu.Lock()
 	p.cachedTURNAddr = addr
 	p.cachedCreds = creds
 	p.cachedCredsTime = time.Now()
+	p.cachedCredsMu.Unlock()
 
 	return addr, creds, nil
 }
@@ -668,12 +686,16 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 
 	// Signal ready
 	if readyCh != nil && !*signaled {
-		*signaled = true
 		select {
 		case readyCh <- struct{}{}:
 		default:
 		}
 	}
+	// Mark as signaled for ALL connection slots (not just slot 0).
+	// This ensures that on reconnection, allowCaptchaBlock=true so the
+	// captcha solver can block and wait for the user to solve the captcha
+	// instead of immediately returning CaptchaRequiredError.
+	*signaled = true
 
 	log.Printf("proxy: DTLS+TURN session established")
 
