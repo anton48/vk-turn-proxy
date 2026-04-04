@@ -61,9 +61,9 @@ func newChromeTransport() http.RoundTripper {
 			}
 			return conn, nil
 		},
-		ForceAttemptHTTP2:  false,
-		MaxIdleConns:       10,
-		IdleConnTimeout:    30 * time.Second,
+		ForceAttemptHTTP2:   false,
+		MaxIdleConns:        10,
+		IdleConnTimeout:     30 * time.Second,
 		MaxIdleConnsPerHost: 5,
 	}
 

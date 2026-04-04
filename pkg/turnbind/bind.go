@@ -93,8 +93,8 @@ type TURNEndpoint struct {
 	addr string
 }
 
-func (e *TURNEndpoint) ClearSrc()            {}
-func (e *TURNEndpoint) SrcToString() string   { return "" }
+func (e *TURNEndpoint) ClearSrc()           {}
+func (e *TURNEndpoint) SrcToString() string { return "" }
 func (e *TURNEndpoint) DstToString() string {
 	if e.addr != "" {
 		return e.addr

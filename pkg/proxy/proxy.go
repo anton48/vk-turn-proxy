@@ -23,34 +23,34 @@ import (
 
 // Config holds proxy configuration.
 type Config struct {
-	PeerAddr       string         // vk-turn-proxy server address (host:port)
-	TurnServer     string         // override TURN server host (optional)
-	TurnPort       string         // override TURN port (optional)
-	VKLink         string         // VK call invite link or link ID
-	UseDTLS        bool           // true = DTLS obfuscation (default mode)
-	UseUDP         bool           // true = UDP to TURN, false = TCP
-	NumConns       int            // number of concurrent connections (default 1)
-	CaptchaSolver  CaptchaSolver  // called when VK requires captcha (may be nil)
+	PeerAddr      string        // vk-turn-proxy server address (host:port)
+	TurnServer    string        // override TURN server host (optional)
+	TurnPort      string        // override TURN port (optional)
+	VKLink        string        // VK call invite link or link ID
+	UseDTLS       bool          // true = DTLS obfuscation (default mode)
+	UseUDP        bool          // true = UDP to TURN, false = TCP
+	NumConns      int           // number of concurrent connections (default 1)
+	CaptchaSolver CaptchaSolver // called when VK requires captcha (may be nil)
 }
 
 // Stats holds live tunnel statistics.
 type Stats struct {
-	TxBytes           int64   `json:"tx_bytes"`
-	RxBytes           int64   `json:"rx_bytes"`
-	ActiveConns       int32   `json:"active_conns"`
-	TotalConns        int32   `json:"total_conns"`
-	TurnRTTms         float64 `json:"turn_rtt_ms"`         // last TURN Allocate RTT
-	DTLSHandshakeMs   float64 `json:"dtls_handshake_ms"`   // last DTLS handshake time
-	LastHandshakeSec  int64   `json:"last_handshake_sec"`  // seconds since last WG handshake
-	Reconnects        int64   `json:"reconnects"`          // total TURN reconnects
-	CaptchaImageURL   string  `json:"captcha_image_url,omitempty"` // non-empty when captcha is pending
-	CaptchaSID        string  `json:"captcha_sid,omitempty"`       // captcha_sid for the pending captcha
+	TxBytes          int64   `json:"tx_bytes"`
+	RxBytes          int64   `json:"rx_bytes"`
+	ActiveConns      int32   `json:"active_conns"`
+	TotalConns       int32   `json:"total_conns"`
+	TurnRTTms        float64 `json:"turn_rtt_ms"`                 // last TURN Allocate RTT
+	DTLSHandshakeMs  float64 `json:"dtls_handshake_ms"`           // last DTLS handshake time
+	LastHandshakeSec int64   `json:"last_handshake_sec"`          // seconds since last WG handshake
+	Reconnects       int64   `json:"reconnects"`                  // total TURN reconnects
+	CaptchaImageURL  string  `json:"captcha_image_url,omitempty"` // non-empty when captcha is pending
+	CaptchaSID       string  `json:"captcha_sid,omitempty"`       // captcha_sid for the pending captcha
 }
 
 // Proxy manages the DTLS+TURN tunnel to the peer server.
 type Proxy struct {
 	config Config
-	ctx    context.Context    // global lifetime (wgTurnOn → wgTurnOff)
+	ctx    context.Context // global lifetime (wgTurnOn → wgTurnOff)
 	cancel context.CancelFunc
 
 	peer   *net.UDPAddr
@@ -74,8 +74,8 @@ type Proxy struct {
 
 	// Captcha handling: when VK requires captcha, the image URL is stored here
 	// and the solver blocks until an answer is provided via SolveCaptcha().
-	captchaImageURL  atomic.Value // stores string (empty = no captcha pending)
-	captchaCh        chan string  // buffered channel for captcha answers
+	captchaImageURL    atomic.Value // stores string (empty = no captcha pending)
+	captchaCh          chan string  // buffered channel for captcha answers
 	lastCaptchaSID     atomic.Value // stores string: captcha_sid from last CaptchaRequiredError
 	lastCaptchaKey     atomic.Value // stores string: success_token from captchaNotRobot.check
 	lastCaptchaTs      atomic.Value // stores float64: captcha_ts from error response
@@ -95,13 +95,13 @@ type Proxy struct {
 	lastRecvTime atomic.Int64
 
 	// Stats
-	txBytes      atomic.Int64
-	rxBytes      atomic.Int64
-	activeConns  atomic.Int32
-	totalConns   atomic.Int32
-	turnRTTns    atomic.Int64  // nanoseconds
-	dtlsHSns    atomic.Int64  // nanoseconds
-	reconnects   atomic.Int64
+	txBytes     atomic.Int64
+	rxBytes     atomic.Int64
+	activeConns atomic.Int32
+	totalConns  atomic.Int32
+	turnRTTns   atomic.Int64 // nanoseconds
+	dtlsHSns    atomic.Int64 // nanoseconds
+	reconnects  atomic.Int64
 }
 
 // NewProxy creates a new proxy instance.
@@ -312,9 +312,9 @@ func (p *Proxy) ForceReconnect() {
 // dead sockets. The watchdog detects this by tracking the last received packet.
 //
 // Two conditions trigger a full reconnect:
-// 1. No packets for 2 min with active connections → dead tunnel
-// 2. Active connections < half of expected for 5+ min → partial recovery stuck
-//    (e.g., after Allocation Quota Reached, only 1-2 of 10 connections survive)
+//  1. No packets for 2 min with active connections → dead tunnel
+//  2. Active connections < half of expected for 5+ min → partial recovery stuck
+//     (e.g., after Allocation Quota Reached, only 1-2 of 10 connections survive)
 func (p *Proxy) runWatchdog() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -400,15 +400,15 @@ func (p *Proxy) GetStats() Stats {
 		captchaSID = v.(string)
 	}
 	return Stats{
-		TxBytes:          p.txBytes.Load(),
-		RxBytes:          p.rxBytes.Load(),
-		ActiveConns:      p.activeConns.Load(),
-		TotalConns:       p.totalConns.Load(),
-		TurnRTTms:        float64(p.turnRTTns.Load()) / 1e6,
-		DTLSHandshakeMs:  float64(p.dtlsHSns.Load()) / 1e6,
-		Reconnects:       p.reconnects.Load(),
-		CaptchaImageURL:  captchaURL,
-		CaptchaSID:       captchaSID,
+		TxBytes:         p.txBytes.Load(),
+		RxBytes:         p.rxBytes.Load(),
+		ActiveConns:     p.activeConns.Load(),
+		TotalConns:      p.totalConns.Load(),
+		TurnRTTms:       float64(p.turnRTTns.Load()) / 1e6,
+		DTLSHandshakeMs: float64(p.dtlsHSns.Load()) / 1e6,
+		Reconnects:      p.reconnects.Load(),
+		CaptchaImageURL: captchaURL,
+		CaptchaSID:      captchaSID,
 	}
 }
 
