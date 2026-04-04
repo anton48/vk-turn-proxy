@@ -12,9 +12,47 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private var pendingMTU: String?
     private var pendingExcludeHosts: [String] = []
 
+    // VK domains that must bypass the tunnel (for captcha WebView & credential fetching).
+    // These are resolved to IPs at startup and excluded from VPN routing.
+    private static let vkCaptchaDomains = [
+        "id.vk.ru",
+        "api.vk.ru",
+        "vk.ru",
+        "login.vk.ru",
+        "api.vk.com",
+        "login.vk.com",
+        "calls.okcdn.ru"
+    ]
+
     private func logMsg(_ msg: String) {
         os_log("%{public}s", log: log, type: .default, msg)
         NSLog("[PacketTunnel] %@", msg)
+    }
+
+    /// Resolve VK captcha/auth domains to IP addresses for route exclusion.
+    /// This ensures the captcha WebView and VK credential requests bypass the tunnel.
+    private func resolveVKHosts() -> [String] {
+        var ips = Set<String>()
+        for domain in Self.vkCaptchaDomains {
+            let host = CFHostCreateWithName(nil, domain as CFString).takeRetainedValue()
+            var resolved = DarwinBoolean(false)
+            CFHostStartInfoResolution(host, .addresses, nil)
+            if let addresses = CFHostGetAddressing(host, &resolved)?.takeUnretainedValue() as? [Data] {
+                for addrData in addresses {
+                    addrData.withUnsafeBytes { ptr in
+                        let sa = ptr.assumingMemoryBound(to: sockaddr.self).baseAddress!
+                        if sa.pointee.sa_family == AF_INET {
+                            let addr = sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+                            if let ipStr = String(cString: inet_ntoa(addr.sin_addr), encoding: .ascii) {
+                                ips.insert(ipStr)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        logMsg("resolveVKHosts: resolved \(ips.count) unique IPs from \(Self.vkCaptchaDomains.count) domains: \(ips.sorted())")
+        return Array(ips)
     }
 
     // MARK: - Tunnel Lifecycle
@@ -121,7 +159,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             }
 
             // PHASE 2: Set final settings with default route and excluded routes
-            // for TURN server and peer server IPs (so their traffic bypasses the tunnel).
+            // for TURN server, peer server, and VK captcha/auth domain IPs
+            // (so their traffic bypasses the tunnel).
             var excludeHosts: [String] = []
             if let peer = peerHost {
                 excludeHosts.append(peer)
@@ -138,6 +177,16 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 }
             } else {
                 self.logMsg("WARNING: wgGetTURNServerIP returned nil")
+            }
+
+            // Resolve VK captcha/auth domains and exclude their IPs.
+            // This ensures the captcha WebView can load even when the tunnel is dead
+            // (e.g., after phone sleep/lock or cell handoff).
+            let vkIPs = self.resolveVKHosts()
+            for ip in vkIPs {
+                if !excludeHosts.contains(ip) {
+                    excludeHosts.append(ip)
+                }
             }
 
             if captchaPending {
@@ -224,6 +273,76 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         if tunnelHandle >= 0 {
             wgResume(tunnelHandle)
         }
+
+        // After wake, the network path may have changed (cell handoff, Wi-Fi switch).
+        // Re-resolve VK domain IPs and refresh route exclusions so the captcha WebView
+        // and credential fetching still work over the new network path.
+        if pendingTunnelAddress == nil {
+            // Only refresh if PHASE 2 was already applied (not deferred)
+            refreshRouteExclusions()
+        }
+    }
+
+    /// Re-apply network settings with freshly resolved VK domain IPs.
+    /// Called after wake to handle network path changes (cell handoff, Wi-Fi switch).
+    private func refreshRouteExclusions() {
+        guard tunnelHandle >= 0 else { return }
+
+        // Get current tunnel settings from the saved config
+        guard let config = (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration,
+              let proxyConfigJSON = config["proxy_config"] as? String else {
+            logMsg("refreshRouteExclusions: no config available")
+            return
+        }
+
+        let tunnelAddress = config["tunnel_address"] as? String ?? "192.168.102.3/24"
+        let dnsServers = config["dns_servers"] as? String ?? "1.1.1.1"
+        let mtu = config["mtu"] as? String ?? "1280"
+
+        var excludeHosts: [String] = []
+
+        // Peer host
+        if let proxyData = proxyConfigJSON.data(using: .utf8),
+           let proxyDict = try? JSONSerialization.jsonObject(with: proxyData) as? [String: Any],
+           let peerAddr = proxyDict["peer_addr"] as? String,
+           let host = peerAddr.split(separator: ":").first.map(String.init) {
+            excludeHosts.append(host)
+        }
+
+        // TURN server IP
+        if let turnIPPtr = wgGetTURNServerIP(tunnelHandle) {
+            let turnIP = String(cString: turnIPPtr)
+            free(UnsafeMutableRawPointer(mutating: turnIPPtr))
+            if !turnIP.isEmpty {
+                excludeHosts.append(turnIP)
+            }
+        }
+
+        // VK captcha/auth domain IPs (re-resolve for potentially new DNS)
+        let vkIPs = resolveVKHosts()
+        for ip in vkIPs {
+            if !excludeHosts.contains(ip) {
+                excludeHosts.append(ip)
+            }
+        }
+
+        logMsg("refreshRouteExclusions: excludeHosts=\(excludeHosts)")
+
+        let settings = createTunnelSettings(
+            address: tunnelAddress,
+            dns: dnsServers,
+            mtu: mtu,
+            captureTraffic: true,
+            excludeHosts: excludeHosts
+        )
+
+        setTunnelNetworkSettings(settings) { [weak self] error in
+            if let error = error {
+                self?.logMsg("refreshRouteExclusions ERROR: \(error)")
+            } else {
+                self?.logMsg("refreshRouteExclusions: routes refreshed OK")
+            }
+        }
     }
 
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
@@ -253,6 +372,14 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             if !turnIP.isEmpty && !excludeHosts.contains(turnIP) {
                 excludeHosts.append(turnIP)
                 logMsg("applyDeferredRoutes: added TURN IP=\(turnIP)")
+            }
+        }
+
+        // Re-resolve VK captcha/auth domain IPs (may have changed since startup)
+        let vkIPs = resolveVKHosts()
+        for ip in vkIPs {
+            if !excludeHosts.contains(ip) {
+                excludeHosts.append(ip)
             }
         }
 

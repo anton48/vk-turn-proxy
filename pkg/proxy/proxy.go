@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	mathrand "math/rand"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -87,6 +89,10 @@ type Proxy struct {
 	cachedCreds     *TURNCreds
 	cachedCredsTime time.Time
 
+	// Watchdog: last time a packet was received (unix seconds).
+	// Used to detect dead tunnels after iOS freeze/thaw.
+	lastRecvTime atomic.Int64
+
 	// Stats
 	txBytes      atomic.Int64
 	rxBytes      atomic.Int64
@@ -129,6 +135,12 @@ func (p *Proxy) Start() error {
 		return fmt.Errorf("proxy already started")
 	}
 
+	// Limit Go scheduler threads to reduce CPU wakeups on iOS.
+	// iOS Network Extensions are killed if they exceed 45000 wakeups/300s.
+	// With 10 connections and ~50 goroutines, unrestricted GOMAXPROCS
+	// causes ~1500 wakes/sec. Limiting to 2 threads keeps us well under.
+	runtime.GOMAXPROCS(2)
+
 	// Parse VK link ID
 	linkID := p.config.VKLink
 	if strings.Contains(linkID, "join/") {
@@ -146,6 +158,11 @@ func (p *Proxy) Start() error {
 		return fmt.Errorf("resolve peer: %w", err)
 	}
 	p.peer = peer
+
+	// Start watchdog goroutine to detect dead tunnels after iOS freeze/thaw.
+	// This is the primary self-healing mechanism — it doesn't rely on iOS
+	// calling sleep()/wake() which is unreliable.
+	go p.runWatchdog()
 
 	return p.startConnections()
 }
@@ -194,8 +211,17 @@ func (p *Proxy) startConnections() error {
 
 	for i := 1; i < p.config.NumConns; i++ {
 		p.wg.Add(1)
+		connIdx := i
 		go func() {
 			defer p.wg.Done()
+			// Stagger connection launches: 200ms between each to avoid
+			// hitting TURN Allocation Quota Reached when all 10 connect at once.
+			delay := time.Duration(connIdx*200) * time.Millisecond
+			select {
+			case <-time.After(delay):
+			case <-sessCtx.Done():
+				return
+			}
 			p.runConnection(sessCtx, p.linkID, nil)
 		}()
 	}
@@ -229,7 +255,9 @@ func (p *Proxy) waitCaptchaAndRestart() {
 // Pause gracefully stops all connections (for sleep).
 func (p *Proxy) Pause() {
 	p.sessMu.Lock()
-	p.sessCancel()
+	if p.sessCancel != nil {
+		p.sessCancel()
+	}
 	p.sessMu.Unlock()
 	// Invalidate cached creds so Resume fetches fresh ones
 	p.cachedCredsMu.Lock()
@@ -239,12 +267,99 @@ func (p *Proxy) Pause() {
 }
 
 // Resume restarts all connections (for wake).
+// Always cancels the old session first — iOS may call wake() without sleep(),
+// or the process may have been frozen without any lifecycle callback.
 func (p *Proxy) Resume() {
 	p.sessMu.Lock()
+	// Cancel any existing session to kill orphaned goroutines.
+	// This is critical: iOS can freeze the process and unfreeze it
+	// without calling sleep(). Old goroutines sit on dead sockets
+	// with stale TURN allocations. We must kill them first.
+	if p.sessCancel != nil {
+		p.sessCancel()
+	}
 	p.sessCtx, p.sessCancel = context.WithCancel(p.ctx)
 	p.sessMu.Unlock()
-	log.Printf("proxy: Resume — starting fresh connections")
+	// Invalidate cached creds — after sleep, TURN allocations expired
+	p.cachedCredsMu.Lock()
+	p.cachedCreds = nil
+	p.cachedCredsMu.Unlock()
+	log.Printf("proxy: Resume — cancelled old session, starting fresh connections")
 	go p.startConnections()
+}
+
+// ForceReconnect tears down all connections and starts fresh.
+// Used by the watchdog when it detects a dead tunnel.
+func (p *Proxy) ForceReconnect() {
+	p.sessMu.Lock()
+	if p.sessCancel != nil {
+		p.sessCancel()
+	}
+	p.sessCtx, p.sessCancel = context.WithCancel(p.ctx)
+	p.sessMu.Unlock()
+	p.cachedCredsMu.Lock()
+	p.cachedCreds = nil
+	p.cachedCredsMu.Unlock()
+	p.reconnects.Add(1)
+	log.Printf("proxy: ForceReconnect — watchdog triggered, starting fresh connections")
+	go p.startConnections()
+}
+
+// runWatchdog monitors tunnel health and forces reconnection when dead.
+// iOS freezes Network Extension processes without calling sleep()/wake().
+// After unfreeze, all TURN allocations are expired but goroutines sit on
+// dead sockets. The watchdog detects this by tracking the last received packet.
+//
+// Two conditions trigger a full reconnect:
+// 1. No packets for 2 min with active connections → dead tunnel
+// 2. Active connections < half of expected for 5+ min → partial recovery stuck
+//    (e.g., after Allocation Quota Reached, only 1-2 of 10 connections survive)
+func (p *Proxy) runWatchdog() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	var lowConnSince time.Time // when we first noticed too few connections
+
+	for {
+		select {
+		case <-ticker.C:
+			lastRecv := p.lastRecvTime.Load()
+			active := p.activeConns.Load()
+			expected := int32(p.config.NumConns)
+
+			// Condition 1: No packets despite active connections → dead tunnel
+			if lastRecv > 0 && active > 0 {
+				elapsed := time.Since(time.Unix(lastRecv, 0))
+				if elapsed > 2*time.Minute {
+					log.Printf("proxy: watchdog — no packets for %s with %d active conns, forcing reconnect",
+						elapsed.Round(time.Second), active)
+					lowConnSince = time.Time{} // reset
+					p.ForceReconnect()
+					continue
+				}
+			}
+
+			// Condition 2: Too few active connections for too long.
+			// After sleep/wake, Allocation Quota Reached kills most connections.
+			// Dormant goroutines will eventually retry (30s-3min), but if the
+			// situation persists, force a clean restart.
+			if lastRecv > 0 && active > 0 && active < expected/2 {
+				if lowConnSince.IsZero() {
+					lowConnSince = time.Now()
+				} else if time.Since(lowConnSince) > 5*time.Minute {
+					log.Printf("proxy: watchdog — only %d/%d conns active for 5+ min, forcing reconnect",
+						active, expected)
+					lowConnSince = time.Time{}
+					p.ForceReconnect()
+					continue
+				}
+			} else {
+				lowConnSince = time.Time{} // reset if healthy
+			}
+		case <-p.ctx.Done():
+			return
+		}
+	}
 }
 
 // SendPacket sends a WireGuard packet through the tunnel.
@@ -346,12 +461,11 @@ func (p *Proxy) Stop() {
 
 // runConnection runs a single connection slot with reconnection.
 // Reconnects on failure until sessCtx is cancelled (Pause/Resume) or global ctx is done (Stop).
-// After 3 consecutive short-lived failures, goes dormant until Resume() restarts via sessCtx.
+// After 3 consecutive short-lived failures, goes dormant for up to 3 minutes.
+// This avoids hammering the TURN server (Allocation Quota Reached) while still
+// recovering without relying on iOS sleep()/wake() which are unreliable.
 func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh chan<- struct{}) error {
 	signaled := false
-	// allowCaptchaBlock is false for the initial connection (readyCh != nil && !signaled)
-	// because the tunnel isn't running yet, so the UI can't show the captcha.
-	// Once the tunnel is established (signaled=true), blocking captcha is safe.
 	shortFailures := 0
 
 	for {
@@ -383,21 +497,36 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 				shortFailures++
 			}
 
-			// After 3 consecutive short-lived failures, go dormant.
-			// Device is likely sleeping. Wait for Resume() (which cancels sessCtx).
+			// After 3 consecutive short-lived failures, go dormant for up to 3 minutes.
+			// This prevents hammering the TURN server when Allocation Quota is reached.
+			// Previously this waited forever for Resume(), but iOS doesn't reliably
+			// call wake() — so we use a timeout and retry with staggered delay.
 			if shortFailures >= 3 {
-				log.Printf("proxy: %d consecutive short failures, going dormant until Resume()", shortFailures)
+				// Stagger dormancy wake-up: random 30s-3min so all 10 connections
+				// don't try to reconnect simultaneously (which causes Quota Reached).
+				dormantDuration := time.Duration(30+mathrand.Intn(150)) * time.Second
+				log.Printf("proxy: %d consecutive short failures, sleeping %s before retry", shortFailures, dormantDuration.Round(time.Second))
 				select {
+				case <-time.After(dormantDuration):
+					shortFailures = 0 // reset after dormancy
+					log.Printf("proxy: waking from dormancy, retrying connection")
+					// Invalidate cached creds so we get fresh ones
+					p.cachedCredsMu.Lock()
+					p.cachedCreds = nil
+					p.cachedCredsMu.Unlock()
 				case <-sessCtx.Done():
 					return sessCtx.Err()
 				case <-p.ctx.Done():
 					return p.ctx.Err()
 				}
+				continue
 			}
 
-			// Brief delay before reconnect
+			// Staggered delay before reconnect: random 2-7s to avoid
+			// all connections hitting TURN server at the same instant.
+			delay := time.Duration(2000+mathrand.Intn(5000)) * time.Millisecond
 			select {
-			case <-time.After(2 * time.Second):
+			case <-time.After(delay):
 			case <-sessCtx.Done():
 				return sessCtx.Err()
 			case <-p.ctx.Done():
@@ -645,16 +774,25 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	}()
 
 	// Receive: dtlsConn → recvCh
+	// Uses 2-minute read deadline (reset on each successful read) to detect
+	// dead connections quickly after iOS freeze/thaw. The old 24h deadline
+	// meant dead connections persisted for hours.
 	go func() {
 		defer wg.Done()
 		defer connCancel()
 		buf := make([]byte, 1600)
 		for {
-			dtlsConn.SetReadDeadline(time.Now().Add(4 * time.Hour))
+			dtlsConn.SetReadDeadline(time.Now().Add(2 * time.Minute))
 			n, err := dtlsConn.Read(buf)
 			if err != nil {
+				if connCtx.Err() != nil {
+					return // context cancelled (Pause/Resume/Stop)
+				}
+				// Read error (timeout or dead connection) — reconnect
+				log.Printf("proxy: DTLS read error: %v", err)
 				return
 			}
+			p.lastRecvTime.Store(time.Now().Unix())
 			pkt := make([]byte, n)
 			copy(pkt, buf[:n])
 			select {
@@ -770,11 +908,16 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 		defer connCancel()
 		buf := make([]byte, 1600)
 		for {
-			conn1.SetReadDeadline(time.Now().Add(4 * time.Hour))
+			conn1.SetReadDeadline(time.Now().Add(2 * time.Minute))
 			n, _, err := conn1.ReadFrom(buf)
 			if err != nil {
+				if connCtx.Err() != nil {
+					return
+				}
+				log.Printf("proxy: direct read error: %v", err)
 				return
 			}
+			p.lastRecvTime.Store(time.Now().Unix())
 			pkt := make([]byte, n)
 			copy(pkt, buf[:n])
 			select {
@@ -835,7 +978,7 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 		Username:               creds.Username,
 		Password:               creds.Password,
 		RequestedAddressFamily: addrFamily,
-		LoggerFactory:          logging.NewDefaultLoggerFactory(),
+		LoggerFactory:          &noopLoggerFactory{},
 	}
 
 	client, err := turn.NewClient(cfg)
@@ -871,16 +1014,13 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 	var peerAddr atomic.Value
 
 	// conn2 → relay
+	// No select{default} polling — context cancellation is handled via deadline
+	// set in context.AfterFunc above, which unblocks ReadFrom.
 	go func() {
 		defer wg.Done()
 		defer turnCancel()
 		buf := make([]byte, 1600)
 		for {
-			select {
-			case <-turnCtx.Done():
-				return
-			default:
-			}
 			n, addr, err := conn2.ReadFrom(buf)
 			if err != nil {
 				return
@@ -898,11 +1038,6 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 		defer turnCancel()
 		buf := make([]byte, 1600)
 		for {
-			select {
-			case <-turnCtx.Done():
-				return
-			default:
-			}
 			n, _, err := relayConn.ReadFrom(buf)
 			if err != nil {
 				return
@@ -957,3 +1092,25 @@ type connectedUDPConn struct {
 func (c *connectedUDPConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 	return c.Write(p)
 }
+
+// noopLoggerFactory suppresses all pion/turn logging to reduce CPU wakeups.
+// The pion logger creates per-message goroutines and timers which
+// contribute to iOS "waking the CPU" violations in Network Extensions.
+type noopLoggerFactory struct{}
+
+func (f *noopLoggerFactory) NewLogger(scope string) logging.LeveledLogger {
+	return &noopLogger{}
+}
+
+type noopLogger struct{}
+
+func (l *noopLogger) Trace(msg string)                          {}
+func (l *noopLogger) Tracef(format string, args ...interface{}) {}
+func (l *noopLogger) Debug(msg string)                          {}
+func (l *noopLogger) Debugf(format string, args ...interface{}) {}
+func (l *noopLogger) Info(msg string)                           {}
+func (l *noopLogger) Infof(format string, args ...interface{})  {}
+func (l *noopLogger) Warn(msg string)                           {}
+func (l *noopLogger) Warnf(format string, args ...interface{})  {}
+func (l *noopLogger) Error(msg string)                          {}
+func (l *noopLogger) Errorf(format string, args ...interface{}) {}

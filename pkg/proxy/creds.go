@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -47,6 +48,12 @@ type TURNCreds struct {
 // savedToken1: if non-empty, reuse this access_token from step1 instead of fetching a new one
 // (the captcha is tied to the original step2 call which used this token1).
 func GetVKCreds(linkID string, captchaSolver CaptchaSolver, solvedCaptchaSID, solvedCaptchaKey string, solvedCaptchaTs, solvedCaptchaAttempt float64, savedToken1 string) (*TURNCreds, error) {
+	// Randomize identity for anti-detection: different UA and name per credential fetch.
+	ua := randomUserAgent()
+	name := generateName()
+	escapedName := neturl.QueryEscape(name)
+	log.Printf("vk: identity — name: %s, UA: %s", name, ua)
+
 	doRequest := func(data string, url string) (resp map[string]interface{}, err error) {
 		client := &http.Client{
 			Timeout: 20 * time.Second,
@@ -61,7 +68,7 @@ func GetVKCreds(linkID string, captchaSolver CaptchaSolver, solvedCaptchaSID, so
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0")
+		req.Header.Add("User-Agent", ua)
 		req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 
 		httpResp, err := client.Do(req)
@@ -123,14 +130,14 @@ func GetVKCreds(linkID string, captchaSolver CaptchaSolver, solvedCaptchaSID, so
 	var err error
 	var data string
 	step2URL := "https://api.vk.ru/method/calls.getAnonymousToken?v=5.274&client_id=6287487"
-	step2Data := fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=123&access_token=%s", linkID, token1)
+	step2Data := fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s", linkID, escapedName, token1)
 
 	// If we have a pre-solved captcha (success_token from captchaNotRobot.check), include it.
 	// Format matches https://github.com/cacggghp/vk-turn-proxy/pull/97
 	if solvedCaptchaSID != "" && solvedCaptchaKey != "" {
 		log.Printf("vk: retrying step2 with success_token (%d chars), captcha_sid=%s", len(solvedCaptchaKey), solvedCaptchaSID)
-		step2Data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=123&access_token=%s&captcha_key=&captcha_sid=%s&is_sound_captcha=0&success_token=%s&captcha_ts=%.3f&captcha_attempt=%d",
-			linkID, token1, solvedCaptchaSID, neturl.QueryEscape(solvedCaptchaKey), solvedCaptchaTs, int(solvedCaptchaAttempt))
+		step2Data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s&captcha_key=&captcha_sid=%s&is_sound_captcha=0&success_token=%s&captcha_ts=%.3f&captcha_attempt=%d",
+			linkID, escapedName, token1, solvedCaptchaSID, neturl.QueryEscape(solvedCaptchaKey), solvedCaptchaTs, int(solvedCaptchaAttempt))
 	}
 
 	for attempt := 0; attempt < 3; attempt++ {
@@ -142,19 +149,54 @@ func GetVKCreds(linkID string, captchaSolver CaptchaSolver, solvedCaptchaSID, so
 		// Check for captcha (VK error code 14)
 		captchaSID, captchaImg, captchaTs, captchaAttempt := extractCaptcha(resp)
 		if captchaSID != "" {
-			log.Printf("vk: captcha required (attempt %d), image: %s", attempt+1, captchaImg)
-			if captchaSolver == nil {
-				return nil, &CaptchaRequiredError{ImageURL: captchaImg, SID: captchaSID, CaptchaTs: captchaTs, CaptchaAttempt: captchaAttempt, Token1: token1}
+			log.Printf("vk: captcha required (attempt %d), url: %s", attempt+1, captchaImg)
+
+			// Try automatic PoW solver first (no user interaction needed).
+			// This works even during phone sleep since it runs in the Network Extension.
+			powCtx, powCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			powToken, powErr := solveCaptchaPoW(powCtx, captchaImg, captchaSID, ua)
+			powCancel()
+
+			if powErr == nil && powToken != "" {
+				log.Printf("vk: PoW auto-solve succeeded (%d chars), retrying step2", len(powToken))
+				step2Data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s&captcha_key=&captcha_sid=%s&is_sound_captcha=0&success_token=%s&captcha_ts=%.3f&captcha_attempt=%d",
+					linkID, escapedName, token1, captchaSID, neturl.QueryEscape(powToken), captchaTs, int(captchaAttempt))
+				continue
 			}
-			answer, err := captchaSolver(captchaImg)
+
+			// PoW failed — the session_token is burned (VK counts the failed attempt).
+			// Do NOT try WebView with the same token — it will show "Attempt limit reached".
+			// Instead, let the outer retry loop re-request step2 to get a fresh captcha.
+			log.Printf("vk: PoW auto-solve failed: %v — requesting fresh captcha for WebView", powErr)
+
+			// Re-request step2 WITHOUT captcha params to get a fresh captcha session
+			step2Data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s", linkID, escapedName, token1)
+			resp, err = doRequest(step2Data, step2URL)
+			if err != nil {
+				return nil, fmt.Errorf("step2 re-request: %w", err)
+			}
+			// Extract fresh captcha from the new response
+			freshSID, freshImg, freshTs, freshAttempt := extractCaptcha(resp)
+			if freshSID == "" {
+				// No captcha this time — maybe VK accepted us?
+				token2, err = extractStr(resp, "response", "token")
+				if err != nil {
+					return nil, fmt.Errorf("step2 parse after fresh: %w", err)
+				}
+				break
+			}
+
+			// Fall back to WebView with fresh captcha session
+			if captchaSolver == nil {
+				return nil, &CaptchaRequiredError{ImageURL: freshImg, SID: freshSID, CaptchaTs: freshTs, CaptchaAttempt: freshAttempt, Token1: token1}
+			}
+			answer, err := captchaSolver(freshImg)
 			if err != nil {
 				return nil, fmt.Errorf("step2: captcha solver: %w", err)
 			}
-			// Retry with captcha answer — use success_token format (PR #97 style)
-			// The WebView extracts success_token from captchaNotRobot.check, which is a long JWT.
-			log.Printf("vk: captcha solver returned answer (%d chars), retrying with success_token format", len(answer))
-			step2Data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=123&access_token=%s&captcha_key=&captcha_sid=%s&is_sound_captcha=0&success_token=%s&captcha_ts=%.3f&captcha_attempt=%d",
-				linkID, token1, captchaSID, neturl.QueryEscape(answer), captchaTs, int(captchaAttempt))
+			log.Printf("vk: WebView captcha solver returned answer (%d chars), retrying", len(answer))
+			step2Data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s&captcha_key=&captcha_sid=%s&is_sound_captcha=0&success_token=%s&captcha_ts=%.3f&captcha_attempt=%d",
+				linkID, escapedName, token1, freshSID, neturl.QueryEscape(answer), freshTs, int(freshAttempt))
 			continue
 		}
 
