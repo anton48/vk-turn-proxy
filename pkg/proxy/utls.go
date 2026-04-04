@@ -46,7 +46,7 @@ func newChromeTransport() http.RoundTripper {
 			}
 			proto := conn.ConnectionState().NegotiatedProtocol
 			if proto != "h2" {
-				conn.Close()
+				_ = conn.Close()
 				return nil, fmt.Errorf("utls: server %s negotiated %q, not h2", addr, proto)
 			}
 			return conn, nil
@@ -98,13 +98,13 @@ func dialChromeTLS(ctx context.Context, network, addr string, forceH1 bool) (*ut
 
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
-		rawConn.Close()
+		_ = rawConn.Close()
 		return nil, fmt.Errorf("split host:port %q: %w", addr, err)
 	}
 
 	spec, err := utls.UTLSIdToSpec(utls.HelloChrome_Auto)
 	if err != nil {
-		rawConn.Close()
+		_ = rawConn.Close()
 		return nil, fmt.Errorf("get Chrome spec: %w", err)
 	}
 
@@ -123,12 +123,12 @@ func dialChromeTLS(ctx context.Context, network, addr string, forceH1 bool) (*ut
 	}, utls.HelloCustom)
 
 	if err := tlsConn.ApplyPreset(&spec); err != nil {
-		rawConn.Close()
+		_ = rawConn.Close()
 		return nil, fmt.Errorf("apply Chrome spec: %w", err)
 	}
 
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		rawConn.Close()
+		_ = rawConn.Close()
 		return nil, fmt.Errorf("uTLS handshake with %s: %w", host, err)
 	}
 

@@ -69,6 +69,8 @@ func randomUserAgent() string {
 }
 
 // randomBrowserProfile returns a full consistent browser profile.
+var _ = randomBrowserProfile
+
 func randomBrowserProfile() BrowserProfile {
 	return browserProfiles[mathrand.Intn(len(browserProfiles))]
 }

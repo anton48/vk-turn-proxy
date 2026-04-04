@@ -23,6 +23,9 @@ import (
 // captchaPowProfile stores the browser profile for the current PoW session.
 var captchaPowProfile BrowserProfile
 
+// randomHex generates a random hex string of n bytes (2n hex chars).
+var _ = randomHex
+
 func randomHex(n int) string {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
@@ -139,7 +142,7 @@ func fetchPoW(ctx context.Context, client *http.Client, redirectURI string) (pow
 	if err != nil {
 		return "", 0, fmt.Errorf("HTTP GET failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	log.Printf("pow: fetchPoW HTTP status=%d", resp.StatusCode)
 
@@ -217,7 +220,7 @@ func callCaptchaNotRobotAPI(ctx context.Context, client *http.Client, sessionTok
 		if err != nil {
 			return nil, fmt.Errorf("HTTP POST %s failed: %w", method, err)
 		}
-		defer httpResp.Body.Close()
+		defer func() { _ = httpResp.Body.Close() }()
 
 		body, err := io.ReadAll(httpResp.Body)
 		if err != nil {
