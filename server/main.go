@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
@@ -23,6 +24,8 @@ func main() {
 	listen := flag.String("listen", "0.0.0.0:56000", "listen on ip:port")
 	connect := flag.String("connect", "", "connect to ip:port")
 	vlessMode := flag.Bool("vless", false, "VLESS mode: forward TCP connections (for VLESS) instead of UDP packets")
+	wrapMode := flag.Bool("wrap", false, "WRAP mode: ChaCha20-XOR obfuscate every UDP packet on the wire to evade VK's DTLS+WG payload classifier (see server/wrap.go). Listener cannot serve plain DTLS clients while -wrap is on; recommended deployment is to bind a fresh port for the wrap listener and leave the existing port for legacy clients.")
+	wrapKeyHex := flag.String("wrap-key", "", "32-byte hex-encoded shared key for -wrap (64 hex chars). Must be identical on client and server. Required when -wrap is set.")
 	flag.Parse()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -44,6 +47,23 @@ func main() {
 	if len(*connect) == 0 {
 		log.Panicf("server address is required")
 	}
+
+	// Decode the wrap key if -wrap is on. Done up front so the operator
+	// gets the error immediately on bad input rather than after binding.
+	var wrapKey []byte
+	if *wrapMode {
+		if *wrapKeyHex == "" {
+			log.Panicf("-wrap requires -wrap-key (32-byte hex string, 64 chars)")
+		}
+		wrapKey, err = hex.DecodeString(*wrapKeyHex)
+		if err != nil {
+			log.Panicf("-wrap-key invalid hex: %v", err)
+		}
+		if len(wrapKey) != wrapKeyLen {
+			log.Panicf("-wrap-key must be %d bytes (got %d)", wrapKeyLen, len(wrapKey))
+		}
+	}
+
 	// Generate a certificate and private key to secure the connection
 	certificate, genErr := selfsign.GenerateSelfSigned()
 	if genErr != nil {
@@ -54,15 +74,26 @@ func main() {
 	// Everything below is the pion-DTLS API! Thanks for using it ❤️.
 	//
 
-	// Connect to a DTLS server
-	listener, err := dtls.ListenWithOptions(
-		"udp",
-		addr,
+	// Connect to a DTLS server. With -wrap, build the listener via our
+	// obfuscation chain (see server/wrap.go); otherwise use pion's
+	// stock UDP backing.
+	dtlsOpts := []dtls.ServerOption{
 		dtls.WithCertificates(certificate),
 		dtls.WithExtendedMasterSecret(dtls.RequireExtendedMasterSecret),
 		dtls.WithCipherSuites(dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256),
 		dtls.WithConnectionIDGenerator(dtls.RandomCIDGenerator(8)),
-	)
+	}
+	var listener net.Listener
+	if *wrapMode {
+		log.Printf("WRAP mode enabled: ChaCha20-XOR obfuscation on the wire (incompatible with non-WRAP clients)")
+		wrapListener, werr := listenWrapped(addr, wrapKey)
+		if werr != nil {
+			panic(werr)
+		}
+		listener, err = dtls.NewListenerWithOptions(wrapListener, dtlsOpts...)
+	} else {
+		listener, err = dtls.ListenWithOptions("udp", addr, dtlsOpts...)
+	}
 	if err != nil {
 		panic(err)
 	}
