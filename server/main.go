@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -25,8 +26,23 @@ func main() {
 	connect := flag.String("connect", "", "connect to ip:port")
 	vlessMode := flag.Bool("vless", false, "VLESS mode: forward TCP connections (for VLESS) instead of UDP packets")
 	wrapMode := flag.Bool("wrap", false, "WRAP mode: ChaCha20-XOR obfuscate every UDP packet on the wire to evade VK's DTLS+WG payload classifier (see server/wrap.go). Listener cannot serve plain DTLS clients while -wrap is on; recommended deployment is to bind a fresh port for the wrap listener and leave the existing port for legacy clients.")
-	wrapKeyHex := flag.String("wrap-key", "", "32-byte hex-encoded shared key for -wrap (64 hex chars). Must be identical on client and server. Required when -wrap is set.")
+	wrapKeyHex := flag.String("wrap-key", "", "32-byte hex-encoded shared key for -wrap (64 hex chars). Must be identical on client and server. Required when -wrap is set. Generate one with -gen-wrap-key.")
+	genWrapKey := flag.Bool("gen-wrap-key", false, "Print a fresh random 64-character hex string suitable for -wrap-key and exit. Uses crypto/rand (same source the WRAP layer uses for per-packet nonces); safe to use in production.")
 	flag.Parse()
+
+	// -gen-wrap-key is a utility mode: print a fresh key and exit before
+	// any of the normal startup paths run. Lets the operator do
+	//   ./vk-turn-proxy-server -gen-wrap-key
+	// and feed the output straight back into -wrap-key on both server
+	// and client without depending on openssl / external tooling.
+	if *genWrapKey {
+		key := make([]byte, wrapKeyLen)
+		if _, err := rand.Read(key); err != nil {
+			log.Panicf("gen-wrap-key: rand.Read: %v", err)
+		}
+		fmt.Println(hex.EncodeToString(key))
+		return
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
