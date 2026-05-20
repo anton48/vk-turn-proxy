@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"flag"
-	"fmt"
 	"io"
 	"log"
 	"net"
@@ -32,7 +31,21 @@ func main() {
 			"and forwards the inner bytes to -connect (typically a local "+
 			"WireGuard instance). Mutually exclusive with the default DTLS "+
 			"listener — pick one mode per server instance.")
+	logFile := flag.String("logfile", "",
+		"if set, append log output to this file instead of stdout. The "+
+			"file is opened in append mode (O_APPEND|O_CREATE) so logs from "+
+			"multiple restarts accumulate. Both the standard log.* calls and "+
+			"the startup banner go through the same writer.")
 	flag.Parse()
+
+	if *logFile != "" {
+		f, err := os.OpenFile(*logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			log.Fatalf("open logfile %q: %v", *logFile, err)
+		}
+		defer f.Close()
+		log.SetOutput(f)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -87,7 +100,7 @@ func runDTLSListener(ctx context.Context, addr *net.UDPAddr, connect string) {
 		}
 	})
 
-	fmt.Println("Listening (DTLS mode)")
+	log.Printf("Listening (DTLS mode) on %s", addr)
 
 	wg1 := sync.WaitGroup{}
 	for {
@@ -148,7 +161,7 @@ func runSRTPListener(ctx context.Context, addr *net.UDPAddr, connect string) {
 		_ = srv.Close()
 	})
 
-	fmt.Printf("Listening (SRTP mode) on %s\n", srv.Addr())
+	log.Printf("Listening (SRTP mode) on %s", srv.Addr())
 
 	wg1 := sync.WaitGroup{}
 	for {
