@@ -209,7 +209,7 @@ func pumpBidirectional(ctx context.Context, conn net.Conn, connect string) {
 		_ = serverConn.SetDeadline(time.Now())
 	})
 
-	// inbound: conn → connect target
+	// inbound: conn → connect target (with probe-echo gate)
 	go func() {
 		defer wg.Done()
 		defer cancel2()
@@ -225,6 +225,28 @@ func pumpBidirectional(ctx context.Context, conn net.Conn, connect string) {
 			if err1 != nil {
 				log.Printf("inbound read failed: %s", err1)
 				return
+			}
+			// Probe-echo: the iOS client sends a 12-byte sentinel
+			// (0xff 'P' 'N' 'G' + 8-byte BE seq) on each conn at
+			// probeInterval to detect zombie conns. Echo it back
+			// verbatim INSTEAD of forwarding to the local WG, which
+			// would drop it as an invalid WG message type and provide
+			// no liveness signal back to the client. Without this
+			// echo, the client's serverProbeable flag never flips
+			// true and its zombie-detection path stays dormant —
+			// fully backward-compatible but missing the post-wake
+			// fast-kill machinery. Mirrors the probe-echo cherry-
+			// picked from upstream PR #168 into add-server-wrap-layer
+			// (commit ccea0d4) — same wire format so both branches
+			// echo the same packets, and the same client-side
+			// recognizer (isProbePacket) handles either response.
+			if n >= 4 && buf[0] == 0xff && buf[1] == 'P' && buf[2] == 'N' && buf[3] == 'G' {
+				_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+				if _, err1 = conn.Write(buf[:n]); err1 != nil {
+					log.Printf("probe-echo write failed: %s", err1)
+					return
+				}
+				continue
 			}
 			_ = serverConn.SetWriteDeadline(time.Now().Add(30 * time.Minute))
 			if _, err1 = serverConn.Write(buf[:n]); err1 != nil {
