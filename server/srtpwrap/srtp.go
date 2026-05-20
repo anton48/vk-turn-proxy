@@ -32,6 +32,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"sync"
@@ -89,7 +90,12 @@ func Client(ctx context.Context, underlay net.PacketConn, remote net.Addr) (net.
 
 	dtlsCh := make(chan []byte, 64)
 	rtpCh := make(chan []byte, 4096)
-	demuxCtx, demuxCancel := context.WithCancel(ctx)
+	// See pkg/proxy/srtpwrap/srtp.go for the long explanation. tl;dr:
+	// production callers cancel `ctx` immediately after Client() returns
+	// (since they pass a handshake-timeout ctx), which would silently
+	// kill the demux goroutine and drop every post-handshake RTP packet.
+	// Demux lifetime is bound to wrappedConn.Close (via stopDemux below).
+	demuxCtx, demuxCancel := context.WithCancel(context.Background())
 	go runDemuxFromPacketConn(demuxCtx, underlay, dtlsCh, rtpCh)
 
 	adapter := &packetConnAdapter{
@@ -221,7 +227,7 @@ func (s *Server) demux() {
 			case <-s.closed:
 				return
 			default:
-				// transient — try to keep going
+				log.Printf("srtpwrap: demux read error: %v", err)
 				continue
 			}
 		}
@@ -249,17 +255,20 @@ func (s *Server) demux() {
 			select {
 			case sess.dtlsCh <- pkt:
 			default:
+				log.Printf("srtpwrap: dropped DTLS packet from %s (dtlsCh full)", src)
 			}
 		case IsRTP(pkt[0]):
 			select {
 			case sess.rtpCh <- pkt:
 			default:
+				log.Printf("srtpwrap: dropped RTP packet from %s (rtpCh full)", src)
 			}
 		}
 	}
 }
 
 func (s *Server) handshakeAndPublish(src net.Addr, sess *serverSession) {
+	t0 := time.Now()
 	adapter := &packetConnAdapter{
 		raw:    s.raw,
 		ch:     sess.dtlsCh,
@@ -274,6 +283,7 @@ func (s *Server) handshakeAndPublish(src net.Addr, sess *serverSession) {
 		},
 	})
 	if err != nil {
+		log.Printf("srtpwrap: dtls.Server() failed for %s: %v", src, err)
 		_ = adapter.Close()
 		s.mu.Lock()
 		delete(s.sessions, src.String())
@@ -286,6 +296,7 @@ func (s *Server) handshakeAndPublish(src net.Addr, sess *serverSession) {
 	hsErr := dconn.HandshakeContext(hsCtx)
 	hsCancel()
 	if hsErr != nil {
+		log.Printf("srtpwrap: handshake failed for %s after %s: %v", src, time.Since(t0).Round(time.Millisecond), hsErr)
 		_ = dconn.Close()
 		_ = adapter.Close()
 		s.mu.Lock()
@@ -295,6 +306,7 @@ func (s *Server) handshakeAndPublish(src net.Addr, sess *serverSession) {
 	}
 	wrap, err := newWrappedConn(s.raw, src, dconn, sess.rtpCh, false /*isClient*/, nil)
 	if err != nil {
+		log.Printf("srtpwrap: newWrappedConn failed for %s: %v", src, err)
 		_ = dconn.Close()
 		_ = adapter.Close()
 		s.mu.Lock()
@@ -307,6 +319,7 @@ func (s *Server) handshakeAndPublish(src net.Addr, sess *serverSession) {
 		delete(s.sessions, src.String())
 		s.mu.Unlock()
 	}
+	log.Printf("srtpwrap: session %s ready (handshake %s)", src, time.Since(t0).Round(time.Millisecond))
 	select {
 	case s.out <- wrap:
 	case <-s.closed:
@@ -408,7 +421,24 @@ func (a *packetConnAdapter) setDl(t time.Time) {
 			return
 		}
 		ch := a.dlCh
-		time.AfterFunc(dur, func() { close(ch) })
+		// CAS-style timer callback: only close ch if it's still the
+		// current deadline channel AND not already closed. Without this
+		// guard, setDl(t1) → setDl(t2) closes ch1 inline, then ch1's
+		// orphan timer fires and panics with "close of closed channel".
+		// Observed 2026-05-20 on the server side simultaneously with
+		// the iOS-side wrappedConn variant — same bug pattern.
+		time.AfterFunc(dur, func() {
+			a.mu.Lock()
+			defer a.mu.Unlock()
+			if a.dlCh != ch {
+				return
+			}
+			select {
+			case <-ch:
+			default:
+				close(ch)
+			}
+		})
 	}
 }
 
@@ -605,31 +635,53 @@ func (c *wrappedConn) setDl(t time.Time) {
 			return
 		}
 		ch := c.dlCh
-		time.AfterFunc(dur, func() { close(ch) })
+		// See pkg/proxy/srtpwrap setDl for the full explanation. Same
+		// "close of closed channel" race: setDl(t1) → setDl(t2) closes
+		// ch1 inline; later ch1's orphan timer fires and panics. Server
+		// side observed crashing 2026-05-20 simultaneously with iOS
+		// build 121 around T+32s of every session.
+		time.AfterFunc(dur, func() {
+			c.dlMu.Lock()
+			defer c.dlMu.Unlock()
+			if c.dlCh != ch {
+				return
+			}
+			select {
+			case <-ch:
+			default:
+				close(ch)
+			}
+		})
 	}
 }
 
 // ─── client-side demux from a single-peer PacketConn ──────────────────────
 
 func runDemuxFromPacketConn(ctx context.Context, raw net.PacketConn, dtlsCh, rtpCh chan<- []byte) {
+	// See iOS pkg/proxy/srtpwrap/srtp.go for the long story. tl;dr: the
+	// previous 500ms-polling pattern was a CPU-wakeup-budget killer on
+	// iOS Network Extension. Block on ReadFrom and use AfterFunc to set
+	// the deadline only on ctx cancellation.
+	stop := context.AfterFunc(ctx, func() {
+		_ = raw.SetReadDeadline(time.Now())
+	})
+	defer stop()
+
 	buf := make([]byte, 2048)
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-		_ = raw.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 		n, _, err := raw.ReadFrom(buf)
 		if err != nil {
-			if errors.Is(err, os.ErrDeadlineExceeded) {
-				continue
+			if ctx.Err() != nil {
+				return
 			}
 			if errors.Is(err, net.ErrClosed) {
 				return
 			}
-			// likely transient — keep going so a single
-			// kernel-level write error doesn't kill the test
+			var ne net.Error
+			if errors.Is(err, os.ErrDeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout()) {
+				_ = raw.SetReadDeadline(time.Time{})
+				continue
+			}
 			continue
 		}
 		if n == 0 {
