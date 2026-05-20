@@ -469,6 +469,16 @@ type wrappedConn struct {
 	// stopDemux is set on the client side so Close() unwinds the
 	// background packet demux goroutine.
 	stopDemux func()
+
+	// Per-side reusable scratch buffers. See iOS-side pkg/proxy/
+	// srtpwrap for the long explanation. Cuts ~4 allocs per packet
+	// (DecryptRTP output, MarshalTo target, EncryptRTP output, plus
+	// pion's internal small allocations). Safe without mutex because
+	// the pumpBidirectional goroutines in main.go dedicate one
+	// goroutine to Read and one to Write per net.Conn.
+	rxDecBuf     []byte
+	txMarshalBuf []byte
+	txEncBuf     []byte
 }
 
 func newWrappedConn(underlay net.PacketConn, remote net.Addr, dconn *dtls.Conn,
@@ -519,10 +529,15 @@ func (c *wrappedConn) Read(b []byte) (int, error) {
 			if !ok {
 				return 0, net.ErrClosed
 			}
-			plain, err := c.decCtx.DecryptRTP(nil, pkt, nil)
+			// Reuse c.rxDecBuf — see iOS-side srtpwrap for rationale.
+			if cap(c.rxDecBuf) < len(pkt) {
+				c.rxDecBuf = make([]byte, 0, len(pkt)+64)
+			}
+			plain, err := c.decCtx.DecryptRTP(c.rxDecBuf[:0], pkt, nil)
 			if err != nil {
 				continue
 			}
+			c.rxDecBuf = plain[:0]
 			var hdr rtp.Header
 			n, err := hdr.Unmarshal(plain)
 			if err != nil {
@@ -557,14 +572,25 @@ func (c *wrappedConn) Write(b []byte) (int, error) {
 		},
 		Payload: b,
 	}
-	raw, err := pkt.Marshal()
+	// Reuse c.txMarshalBuf and c.txEncBuf — see iOS-side srtpwrap.
+	needSize := pkt.MarshalSize()
+	if cap(c.txMarshalBuf) < needSize {
+		c.txMarshalBuf = make([]byte, needSize+64)
+	}
+	rawLen, err := pkt.MarshalTo(c.txMarshalBuf[:needSize])
 	if err != nil {
 		return 0, fmt.Errorf("rtp marshal: %w", err)
 	}
-	enc, err := c.encCtx.EncryptRTP(nil, raw, nil)
+	raw := c.txMarshalBuf[:rawLen]
+	encSize := rawLen + 16
+	if cap(c.txEncBuf) < encSize {
+		c.txEncBuf = make([]byte, 0, encSize+64)
+	}
+	enc, err := c.encCtx.EncryptRTP(c.txEncBuf[:0], raw, nil)
 	if err != nil {
 		return 0, fmt.Errorf("srtp encrypt: %w", err)
 	}
+	c.txEncBuf = enc[:0]
 	if _, err := c.underlay.WriteTo(enc, c.remote); err != nil {
 		return 0, err
 	}
