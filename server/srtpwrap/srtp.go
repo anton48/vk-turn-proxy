@@ -555,12 +555,26 @@ func (c *wrappedConn) Read(b []byte) (int, error) {
 }
 
 func (c *wrappedConn) Write(b []byte) (int, error) {
+	// Lock held for the entire method, not just the seq/ts increment.
+	// Mirror of the client-side fix in cacggghp/vk-turn-proxy-ios
+	// pkg/proxy/srtpwrap/srtp.go: pion's srtp.Context.EncryptRTP is
+	// NOT safe for concurrent use (HMAC-SHA1 keeps internal state across
+	// Sum() calls), and the per-conn scratch buffers (txMarshalBuf,
+	// txEncBuf) cannot be safely shared between Write callers either.
+	// Server-side pumpBidirectional currently has only one writer per
+	// wrappedConn, so this race is not actively triggered today — but
+	// holding the lock through the entire Write is defensive against
+	// any future caller that adds a second writer (e.g. server-side
+	// probe-back, multi-stream multiplexing). The client side hit this
+	// race in build 125 production after the probe sender goroutine
+	// was added — see the iOS commit for the full panic stack.
 	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	seq := c.seq
 	ts := c.ts
 	c.seq++
 	c.ts += uint32(len(b))
-	c.mu.Unlock()
 
 	pkt := rtp.Packet{
 		Header: rtp.Header{
