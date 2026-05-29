@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -30,7 +31,24 @@ func main() {
 			"terminates DTLS-SRTP sessions, decrypts RTP-wrapped payload, "+
 			"and forwards the inner bytes to -connect (typically a local "+
 			"WireGuard instance). Mutually exclusive with the default DTLS "+
-			"listener — pick one mode per server instance.")
+			"listener and with -wrap-srtp — pick one mode per server instance.")
+	useWrapSrtp := flag.Bool("wrap-srtp", false,
+		"enable WRAP+SRTP-mimic listener mode (accepts DTLS+WG inside an "+
+			"SRTP-shaped envelope from clients with useWrap=true and "+
+			"matching -wrap-key). Same intent as -srtp — bypass VK's content "+
+			"classifier — but uses the legacy DTLS+WG inner layer wrapped in "+
+			"a static-key ChaCha20-Poly1305 SRTP envelope, allowing a A/B "+
+			"comparison against the real DTLS-SRTP path. Mutually exclusive "+
+			"with -srtp.")
+	wrapKey := flag.String("wrap-key", "",
+		"32-byte hex key for -wrap-srtp mode (64 hex chars). Generate one "+
+			"with -gen-wrap-key. MUST match the client's wrap_key_hex value "+
+			"exactly — wrong keys produce AEAD-open failures on every packet "+
+			"and the handshake never completes.")
+	genWrapKey := flag.Bool("gen-wrap-key", false,
+		"print a freshly generated 32-byte WRAP key as a 64-char hex string "+
+			"to stdout and exit. Use the output as both -wrap-key (server) "+
+			"and wrap_key_hex (client backup JSON / Settings UI).")
 	logFile := flag.String("logfile", "",
 		"if set, append log output to this file instead of stdout. The "+
 			"file is opened in append mode (O_APPEND|O_CREATE) so logs from "+
@@ -45,6 +63,30 @@ func main() {
 		}
 		defer f.Close()
 		log.SetOutput(f)
+	}
+
+	// Utility mode: print a key and exit. Runs before -connect validation
+	// so admins can generate keys on a fresh box without a -connect target.
+	if *genWrapKey {
+		k, err := genWrapKeyHex()
+		if err != nil {
+			log.Fatalf("gen-wrap-key: %v", err)
+		}
+		// Print to STDOUT directly (not log.Printf) so the key is on its
+		// own line without timestamp / log prefix — pipeable into config.
+		fmt.Println(k)
+		return
+	}
+
+	// Mode flags are mutually exclusive — guard up front before any
+	// listener allocation. The default (neither flag set) is legacy DTLS.
+	if *useSrtp && *useWrapSrtp {
+		log.Fatalf("server: -srtp and -wrap-srtp are mutually exclusive")
+	}
+
+	wrapKeyBytes, err := decodeWrapKey(*useWrapSrtp, *wrapKey)
+	if err != nil {
+		log.Fatalf("server: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -67,11 +109,14 @@ func main() {
 		log.Panicf("server address is required")
 	}
 
-	if *useSrtp {
+	switch {
+	case *useSrtp:
 		runSRTPListener(ctx, addr, *connect)
-		return
+	case *useWrapSrtp:
+		runWrapSRTPListener(ctx, addr, *connect, wrapKeyBytes)
+	default:
+		runDTLSListener(ctx, addr, *connect)
 	}
-	runDTLSListener(ctx, addr, *connect)
 }
 
 // runDTLSListener is the legacy listener mode — accepts DTLS sessions
@@ -124,6 +169,85 @@ func runDTLSListener(ctx context.Context, addr *net.UDPAddr, connect string) {
 			defer wg1.Done()
 			defer conn.Close()
 			log.Printf("Connection from %s\n", conn.RemoteAddr())
+
+			ctx1, cancel1 := context.WithTimeout(ctx, 30*time.Second)
+			dtlsConn, ok := conn.(*dtls.Conn)
+			if !ok {
+				log.Println("Type error")
+				cancel1()
+				return
+			}
+			log.Println("Start handshake")
+			if err := dtlsConn.HandshakeContext(ctx1); err != nil {
+				log.Println(err)
+				cancel1()
+				return
+			}
+			cancel1()
+			log.Println("Handshake done")
+
+			pumpBidirectional(ctx, conn, connect)
+		}(conn)
+	}
+}
+
+// runWrapSRTPListener is the WRAP+SRTP-mimic mode. Mirrors
+// runDTLSListener's accept loop but inserts the SRTP-shaped envelope
+// (see wrap.go) between UDP and DTLS — so the wire pattern matches
+// VK's classifier expectation for RTP media while the inner DTLS+WG
+// flow remains identical to the legacy mode. Compatible client is
+// iOS app with useWrap=true and matching wrap_key_hex.
+func runWrapSRTPListener(ctx context.Context, addr *net.UDPAddr, connect string, key []byte) {
+	certificate, genErr := selfsign.GenerateSelfSigned()
+	if genErr != nil {
+		panic(genErr)
+	}
+
+	config := &dtls.Config{
+		Certificates:          []tls.Certificate{certificate},
+		ExtendedMasterSecret:  dtls.RequireExtendedMasterSecret,
+		CipherSuites:          []dtls.CipherSuiteID{dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
+		ConnectionIDGenerator: dtls.RandomCIDGenerator(8),
+	}
+
+	wrapListener, err := listenWrapped(addr, key)
+	if err != nil {
+		panic(err)
+	}
+	listener, err := dtls.NewListener(wrapListener, config)
+	if err != nil {
+		panic(err)
+	}
+	context.AfterFunc(ctx, func() {
+		if err = listener.Close(); err != nil {
+			panic(err)
+		}
+	})
+
+	log.Printf("Listening (WRAP+SRTP-mimic mode) on %s", addr)
+
+	wg1 := sync.WaitGroup{}
+	for {
+		select {
+		case <-ctx.Done():
+			wg1.Wait()
+			return
+		default:
+		}
+		conn, err := listener.Accept()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				wg1.Wait()
+				return
+			}
+			log.Println(err)
+			continue
+		}
+		wg1.Add(1)
+		go func(conn net.Conn) {
+			defer wg1.Done()
+			defer conn.Close()
+			log.Printf("WRAP+SRTP connection from %s\n", conn.RemoteAddr())
 
 			ctx1, cancel1 := context.WithTimeout(ctx, 30*time.Second)
 			dtlsConn, ok := conn.(*dtls.Conn)
