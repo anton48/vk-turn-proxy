@@ -523,9 +523,11 @@ type wrappedConn struct {
 	closed    chan struct{}
 	onClose   func()
 
-	dlMu  sync.Mutex
-	dlExp time.Time
-	dlCh  chan struct{}
+	dlMu     sync.Mutex
+	dlExp    time.Time
+	dlCh     chan struct{}
+	dlClosed bool        // dlCh currently closed? recreate before next arm (mirror iOS build 146)
+	dlTimer  *time.Timer // single reusable deadline timer; Reset, not AfterFunc-per-call (mirror iOS build 146)
 
 	// stopDemux is set on the client side so Close() unwinds the
 	// background packet demux goroutine.
@@ -711,6 +713,7 @@ func (c *wrappedConn) deadlineCh() <-chan struct{} {
 	defer c.dlMu.Unlock()
 	if c.dlCh == nil {
 		c.dlCh = make(chan struct{})
+		c.dlClosed = false
 	}
 	return c.dlCh
 }
@@ -721,42 +724,57 @@ func (c *wrappedConn) deadlineExpired() bool {
 	return !c.dlExp.IsZero() && !time.Now().Before(c.dlExp)
 }
 
+// setDl arms the read deadline. Mirror of iOS pkg/proxy/srtpwrap build 146: a
+// single reusable per-conn timer (Reset) replaces make(chan struct{}) +
+// time.AfterFunc(30s)-per-call, which allocated a channel + a 30s-pending timer
+// on EVERY call (a per-packet allocation + retention source when the read loop
+// re-arms the deadline before each Read). Reusing one timer is allocation-free
+// in steady state and makes the old "superseded timer double-closes dlCh" race
+// structurally impossible (dlExp/dlClosed guards kept regardless).
 func (c *wrappedConn) setDl(t time.Time) {
 	c.dlMu.Lock()
 	defer c.dlMu.Unlock()
-	if c.dlCh != nil {
-		select {
-		case <-c.dlCh:
-		default:
-			close(c.dlCh)
-		}
-	}
-	c.dlCh = make(chan struct{})
 	c.dlExp = t
-	if !t.IsZero() {
-		dur := time.Until(t)
-		if dur <= 0 {
-			close(c.dlCh)
-			return
+	if c.dlCh == nil || c.dlClosed {
+		c.dlCh = make(chan struct{})
+		c.dlClosed = false
+	}
+	if t.IsZero() {
+		if c.dlTimer != nil {
+			c.dlTimer.Stop()
 		}
-		ch := c.dlCh
-		// See pkg/proxy/srtpwrap setDl for the full explanation. Same
-		// "close of closed channel" race: setDl(t1) → setDl(t2) closes
-		// ch1 inline; later ch1's orphan timer fires and panics. Server
-		// side observed crashing 2026-05-20 simultaneously with iOS
-		// build 121 around T+32s of every session.
-		time.AfterFunc(dur, func() {
-			c.dlMu.Lock()
-			defer c.dlMu.Unlock()
-			if c.dlCh != ch {
-				return
-			}
-			select {
-			case <-ch:
-			default:
-				close(ch)
-			}
-		})
+		return
+	}
+	dur := time.Until(t)
+	if dur <= 0 {
+		close(c.dlCh)
+		c.dlClosed = true
+		if c.dlTimer != nil {
+			c.dlTimer.Stop()
+		}
+		return
+	}
+	if c.dlTimer == nil {
+		c.dlTimer = time.AfterFunc(dur, c.fireDeadline)
+	} else {
+		c.dlTimer.Reset(dur)
+	}
+}
+
+// fireDeadline runs on the runtime timer goroutine when the reusable deadline
+// timer expires; closes dlCh to wake a blocked Read unless a concurrent setDl
+// pushed the deadline into the future (the single timer was Reset and will fire
+// again later). dlMu serialises against setDl; the dlExp/dlClosed guards make a
+// stale fire a no-op and prevent close-of-closed.
+func (c *wrappedConn) fireDeadline() {
+	c.dlMu.Lock()
+	defer c.dlMu.Unlock()
+	if c.dlExp.IsZero() || time.Now().Before(c.dlExp) {
+		return
+	}
+	if c.dlCh != nil && !c.dlClosed {
+		close(c.dlCh)
+		c.dlClosed = true
 	}
 }
 
