@@ -104,10 +104,11 @@ jobs:
             EXT=
           fi
 
-          GOOS=$GOOS GOARCH=$GOARCH GOARM=$GOARM \
-          go build -ldflags "-s -w -checklinkname=0" -trimpath \
-            -o "dist/client-${GOOS}-${GOARCH}${EXT}" \
-            ./client
+          # Server-only release. The ./client tree is unmaintained
+          # upstream code (cacggghp/vk-turn-proxy); publishing it caused
+          # users to download stale April client binaries and try to run
+          # them as if they were this project's client. Do NOT add a
+          # ./client build here — the real client is the iOS app.
           
           GOOS=$GOOS GOARCH=$GOARCH GOARM=$GOARM \
           go build -ldflags "-s -w -checklinkname=0" -trimpath \
