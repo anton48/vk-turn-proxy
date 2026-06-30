@@ -22,7 +22,3 @@
 ## Credits
 
 Based on [vk-turn-proxy](https://github.com/cacggghp/vk-turn-proxy) by [cacggghp](https://github.com/cacggghp).
-
-## License
-
-MIT
