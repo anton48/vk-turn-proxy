@@ -49,6 +49,47 @@ func main() {
 		"print a freshly generated 32-byte WRAP key as a 64-char hex string "+
 			"to stdout and exit. Use the output as both -wrap-key (server) "+
 			"and wrap_key_hex (client backup JSON / Settings UI).")
+	singleClient := flag.Bool("single-client", false,
+		"EXPERIMENT: multiplex ALL connections onto ONE UDP socket toward "+
+			"-connect and schedule the return path explicitly across the "+
+			"connections, instead of the default one-socket-per-connection. "+
+			"Removes the downlink concentration caused by WireGuard holding a "+
+			"single roaming endpoint per peer (see server/downlink.go). "+
+			"⚠️ CORRECT FOR ONE CLIENT ONLY — with two clients connected the "+
+			"return traffic of one is sprayed across the other's connections "+
+			"and lost. Default off; do not enable on a shared server.")
+	rcvBuf := flag.Int("downlink-rcvbuf", dlReadBuffer/1024,
+		"receive buffer for the shared -single-client socket, in KiB. 0 "+
+			"(default) keeps the OS default. ❌ RAISING THIS WAS TESTED AND "+
+			"REJECTED: at 1 MiB against FreeBSD's 42080 B default, same pacer "+
+			"rate back to back, throughput did not change at all (steady ΣDOWN "+
+			"59.33 Mbit/s both, delivery ~100% both) while loaded download "+
+			"latency went 299 -> 488 ms and the speedtest fell 58.1 -> 55.2. "+
+			"The pacer sets the rate; the buffer only decides whether the "+
+			"excess is dropped early or delayed. Kept as a flag so the result "+
+			"can be re-checked, not because it should be on.")
+	paceRate := flag.Float64("downlink-pace", 0,
+		"EXPERIMENT (M2b): shape each connection's downlink to this many KiB/s "+
+			"of COUNTED WIRE BYTES — payload plus ~30 B/packet, which is what "+
+			"VK's per-allocation policer actually meters. 0 (default) = off. "+
+			"Why: with -single-client the downlink is even but bursty, and 11.9% "+
+			"of measured per-connection samples are offered ABOVE the cap, of "+
+			"which the policer's token bucket drops ~10%. The measured cap is "+
+			"~260 KiB/s counted; 247 (95% of it) is the suggested starting "+
+			"point. Read the 'pacer:' line in conn-stats — 0 delayed writes "+
+			"means the rate is too high to be shaping anything.")
+	paceBurst := flag.Float64("downlink-pace-burst", 16,
+		"bucket capacity for -downlink-pace, in KiB of counted bytes. This is "+
+			"how much overshoot survives the pacer, so it is the whole point: "+
+			"too large and nothing is smoothed. 16 KiB is ~64 ms at the "+
+			"suggested rate. Ignored when -downlink-pace is 0.")
+	statsInterval := flag.Duration("conn-stats-interval", connStatsInterval,
+		"how often to dump the per-connection UP/DOWN table. The 60s default "+
+			"is fine for a running server, but a speedtest alternates download, "+
+			"upload and idle inside one interval, so per-connection SHARES "+
+			"computed over 60s are not the shares during the download burst. "+
+			"Drop this to 2s-5s when measuring, and read the logged KB/s "+
+			"directly rather than deriving rates from shares.")
 	logFile := flag.String("logfile", "",
 		"if set, append log output to this file instead of stdout. The "+
 			"file is opened in append mode (O_APPEND|O_CREATE) so logs from "+
@@ -109,20 +150,71 @@ func main() {
 		log.Panicf("server address is required")
 	}
 
+	// M2b: the downlink pacer, opt-in, hub-only.
+	//
+	// Refused without -single-client on purpose. Without the shared socket the
+	// downlink is 7-9x uneven and there is no work-stealing, so a uniform
+	// per-connection rate would throttle the one hot connection while its
+	// packets queued in its own private socket — nothing would move to the idle
+	// connections, and the run would measure added latency rather than shaping.
+	if *paceRate > 0 {
+		if !*singleClient {
+			log.Fatalf("server: -downlink-pace requires -single-client " +
+				"(without the shared socket there is no work-stealing, so pacing " +
+				"one connection cannot move its packets to an idle one)")
+		}
+		downlinkPaceRate = *paceRate * 1024
+		downlinkPaceBurst = *paceBurst * 1024
+		if downlinkPaceBurst < pacerMaxCost {
+			// A bucket smaller than one maximum-size packet can never fill
+			// enough to send one, and every write would stall forever.
+			downlinkPaceBurst = pacerMaxCost
+			log.Printf("⚠️  -downlink-pace-burst raised to %.0f B: it must hold "+
+				"at least one maximum-size packet", downlinkPaceBurst)
+		}
+		log.Printf("⚠️  -downlink-pace is ON: %.0f KiB/s of counted bytes per "+
+			"connection (payload + %d B/packet), burst %.0f KiB. Watch the "+
+			"'pacer:' line — 0 delayed writes means it is inert.",
+			downlinkPaceRate/1024, pacerPerPacketOverhead, downlinkPaceBurst/1024)
+	}
+
+	// M0: per-conn byte counters, always on, no behaviour change.
+	if *statsInterval > 0 {
+		connStatsInterval = *statsInterval
+	}
+	statsDone := make(chan struct{})
+	defer close(statsDone)
+	go runConnStatsLoop(statsDone)
+
+	// M1: the shared-socket downlink scheduler, opt-in.
+	var hub *downlinkHub
+	if *rcvBuf >= 0 {
+		dlReadBuffer = *rcvBuf * 1024
+	}
+	if *singleClient {
+		hub, err = newDownlinkHub(ctx, *connect)
+		if err != nil {
+			log.Fatalf("server: -single-client: %v", err)
+		}
+		log.Printf("⚠️  -single-client is ON: one shared socket to %s with an "+
+			"explicit downlink scheduler. This is CORRECT ONLY while exactly "+
+			"ONE client is connected.", *connect)
+	}
+
 	switch {
 	case *useSrtp:
-		runSRTPListener(ctx, addr, *connect)
+		runSRTPListener(ctx, addr, *connect, hub)
 	case *useWrapSrtp:
-		runWrapSRTPListener(ctx, addr, *connect, wrapKeyBytes)
+		runWrapSRTPListener(ctx, addr, *connect, wrapKeyBytes, hub)
 	default:
-		runDTLSListener(ctx, addr, *connect)
+		runDTLSListener(ctx, addr, *connect, hub)
 	}
 }
 
 // runDTLSListener is the legacy listener mode — accepts DTLS sessions
 // directly and pumps decrypted bytes to/from the -connect target. This
 // is what the unmodified pre-2026-05-20 server was always doing.
-func runDTLSListener(ctx context.Context, addr *net.UDPAddr, connect string) {
+func runDTLSListener(ctx context.Context, addr *net.UDPAddr, connect string, hub *downlinkHub) {
 	certificate, genErr := selfsign.GenerateSelfSigned()
 	if genErr != nil {
 		panic(genErr)
@@ -186,7 +278,7 @@ func runDTLSListener(ctx context.Context, addr *net.UDPAddr, connect string) {
 			cancel1()
 			log.Println("Handshake done")
 
-			pumpBidirectional(ctx, conn, connect)
+			pumpBidirectional(ctx, conn, connect, hub)
 		}(conn)
 	}
 }
@@ -197,7 +289,7 @@ func runDTLSListener(ctx context.Context, addr *net.UDPAddr, connect string) {
 // VK's classifier expectation for RTP media while the inner DTLS+WG
 // flow remains identical to the legacy mode. Compatible client is
 // iOS app with useWrap=true and matching wrap_key_hex.
-func runWrapSRTPListener(ctx context.Context, addr *net.UDPAddr, connect string, key []byte) {
+func runWrapSRTPListener(ctx context.Context, addr *net.UDPAddr, connect string, key []byte, hub *downlinkHub) {
 	certificate, genErr := selfsign.GenerateSelfSigned()
 	if genErr != nil {
 		panic(genErr)
@@ -265,7 +357,7 @@ func runWrapSRTPListener(ctx context.Context, addr *net.UDPAddr, connect string,
 			cancel1()
 			log.Println("Handshake done")
 
-			pumpBidirectional(ctx, conn, connect)
+			pumpBidirectional(ctx, conn, connect, hub)
 		}(conn)
 	}
 }
@@ -276,7 +368,7 @@ func runWrapSRTPListener(ctx context.Context, addr *net.UDPAddr, connect string,
 // decrypted RTP payload, each Write frames one outgoing payload as an
 // RTP+SRTP packet. Bidirectional pump then forwards the payload bytes
 // to/from -connect (typically local WireGuard).
-func runSRTPListener(ctx context.Context, addr *net.UDPAddr, connect string) {
+func runSRTPListener(ctx context.Context, addr *net.UDPAddr, connect string, hub *downlinkHub) {
 	srv, err := srtpwrap.Listen(addr)
 	if err != nil {
 		panic(err)
@@ -304,7 +396,7 @@ func runSRTPListener(ctx context.Context, addr *net.UDPAddr, connect string) {
 			defer wg1.Done()
 			defer c.Close()
 			log.Printf("SRTP session from %s\n", c.RemoteAddr())
-			pumpBidirectional(ctx, c, connect)
+			pumpBidirectional(ctx, c, connect, hub)
 			log.Printf("SRTP session closed: %s\n", c.RemoteAddr())
 		}(conn)
 	}
@@ -313,24 +405,44 @@ func runSRTPListener(ctx context.Context, addr *net.UDPAddr, connect string) {
 // pumpBidirectional dials the -connect target via UDP and pumps bytes
 // in both directions between conn and that target until either side
 // returns an error or the context is cancelled.
-func pumpBidirectional(ctx context.Context, conn net.Conn, connect string) {
-	serverConn, err := net.Dial("udp", connect)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-	defer func() {
-		if err = serverConn.Close(); err != nil {
-			log.Printf("failed to close outgoing connection: %s", err)
+func pumpBidirectional(ctx context.Context, conn net.Conn, connect string, hub *downlinkHub) {
+	st := registry.add(conn.RemoteAddr().String())
+	defer registry.remove(st)
+
+	// Where this connection's uplink goes.
+	//
+	//   hub != nil (-single-client): the hub's SHARED socket. It outlives every
+	//     individual connection, so it must never be closed or deadlined here.
+	//     WireGuard then sees one source for the peer and its single endpoint
+	//     stops moving, which is the whole point — see server/downlink.go.
+	//   hub == nil (default): a private socket dialled for this connection.
+	//     This is the topology that lets WireGuard's roaming endpoint pin the
+	//     entire downlink onto whichever connection delivered last.
+	var serverConn net.Conn
+	if hub != nil {
+		serverConn = hub.wg
+	} else {
+		c, dialErr := net.Dial("udp", connect)
+		if dialErr != nil {
+			log.Println(dialErr)
+			return
 		}
-	}()
+		defer func() {
+			if err := c.Close(); err != nil {
+				log.Printf("failed to close outgoing connection: %s", err)
+			}
+		}()
+		serverConn = c
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 	ctx2, cancel2 := context.WithCancel(ctx)
 	context.AfterFunc(ctx2, func() {
 		_ = conn.SetDeadline(time.Now())
-		_ = serverConn.SetDeadline(time.Now())
+		if hub == nil {
+			_ = serverConn.SetDeadline(time.Now())
+		}
 	})
 
 	// inbound: conn → connect target (with probe-echo gate)
@@ -372,18 +484,30 @@ func pumpBidirectional(ctx context.Context, conn net.Conn, connect string) {
 				}
 				continue
 			}
-			_ = serverConn.SetWriteDeadline(time.Now().Add(30 * time.Minute))
+			// The shared socket carries every connection's uplink, so a write
+			// deadline set here would apply to all of them — skip it in hub
+			// mode. UDP writes to a connected socket do not block anyway.
+			if hub == nil {
+				_ = serverConn.SetWriteDeadline(time.Now().Add(30 * time.Minute))
+			}
 			if _, err1 = serverConn.Write(buf[:n]); err1 != nil {
 				log.Printf("inbound write failed: %s", err1)
 				return
 			}
+			st.up.Add(int64(n))
 		}
 	}()
 
-	// outbound: connect target → conn
+	// outbound: WireGuard → conn
 	go func() {
 		defer wg.Done()
 		defer cancel2()
+		if hub != nil {
+			// Steal packets from the shared return queue instead of owning a
+			// private socket. Whoever is free takes the next one.
+			hub.serveConn(ctx2, conn, st)
+			return
+		}
 		buf := make([]byte, 1600)
 		for {
 			select {
@@ -402,6 +526,8 @@ func pumpBidirectional(ctx context.Context, conn net.Conn, connect string) {
 				log.Printf("outbound write failed: %s", err1)
 				return
 			}
+			st.down.Add(int64(n))
+			st.downPkts.Add(1)
 		}
 	}()
 	wg.Wait()

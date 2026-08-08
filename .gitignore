@@ -10,6 +10,9 @@ DerivedData/
 # Go
 vendor/
 
+# Cross-built server binaries left in the tree by measurement runs
+vk-turn-proxy-server-*
+
 # macOS
 .DS_Store
 keys/
