@@ -39,6 +39,29 @@ const (
 	// pacerMaxCost is the reservation taken before dequeuing, i.e. the cost of
 	// the largest packet the hub can produce.
 	pacerMaxCost = dlBufSize + pacerPerPacketOverhead
+
+	// defaultPaceKiB is the shipped rate, in KiB/s of counted bytes per
+	// connection. It is ON by default because not pacing is not neutral: an
+	// unpaced connection offers more than VK will carry, and ~10% of the
+	// downlink is dropped — worth about 16% of throughput.
+	//
+	// WHERE 247 COMES FROM. A packet-size sweep put the policer at W ~ 260 KiB/s
+	// of counted bytes; 247 is 95% of that. The knee was then bracketed by
+	// direct measurement rather than left to the fit: at 247 delivery is
+	// 100.00%, byte-exact on every connection, and at 260 it falls to 97.96%
+	// while throughput drops 9.4% — a ~4.6x loss amplification at a 250 ms RTT.
+	// Overshooting the knee is far more expensive than sitting under it, which
+	// is why the margin points down.
+	//
+	// ⚠️ SAFE AS A UNIVERSAL DEFAULT for three specific reasons, not by
+	// assumption: the policer is a GLOBAL VK policy (four relays across two
+	// netblocks, 0.4% spread), the unit is COUNTED BYTES so the same number is
+	// correct at any MTU, and the pacer only binds when the traffic would have
+	// exceeded the cap anyway — below that it never blocks and adds no latency.
+	// The one real risk is the opposite direction: if VK's W is ever higher
+	// than 260, this caps us below what is available. Re-run the rate sweep
+	// before assuming it has not moved.
+	defaultPaceKiB = 247
 )
 
 // Set once from main before any listener starts, then read-only — same shape as

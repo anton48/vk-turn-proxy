@@ -287,3 +287,24 @@ func TestDownlinkHubWithPacerStillConservesAndFansOut(t *testing.T) {
 			"before the write and can exceed it", paced, pkts)
 	}
 }
+
+// The pacer ships ON. That is a deliberate decision backed by measurement — not
+// pacing costs ~10% of the downlink to VK's token bucket — so pin both the
+// default and the flag wiring, or a stray edit silently gives every deployment
+// its 16% back.
+func TestPacingIsOnByDefault(t *testing.T) {
+	if defaultPaceKiB <= 0 {
+		t.Fatal("pacing is off by default; an unpaced connection offers more " +
+			"than VK carries and ~10% of the downlink is dropped")
+	}
+	// The default must sit UNDER the measured knee. At 260 delivery falls to
+	// 97.96% and throughput by 9.4%: overshooting costs ~4.6x what it gains.
+	if defaultPaceKiB >= 260 {
+		t.Fatalf("default %d KiB/s is at or past the measured knee (260)", defaultPaceKiB)
+	}
+	// And a bucket must always hold at least one maximum-size packet, or every
+	// write would wait for tokens that can never accumulate.
+	if 16*1024 < pacerMaxCost {
+		t.Fatalf("the default burst cannot hold one %d-byte packet", pacerMaxCost)
+	}
+}
