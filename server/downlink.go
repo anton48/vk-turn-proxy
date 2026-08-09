@@ -78,8 +78,9 @@ type dlPacket struct {
 }
 
 type downlinkHub struct {
-	wg net.Conn
-	ch chan dlPacket
+	wg    net.Conn
+	ch    chan dlPacket
+	reseq *resequencer // nil unless -uplink-reseq is set
 }
 
 func newDownlinkHub(ctx context.Context, connect string) (*downlinkHub, error) {
@@ -120,7 +121,24 @@ func newDownlinkHub(ctx context.Context, connect string) (*downlinkHub, error) {
 			dlReadBuffer/1024)
 	}
 	h := &downlinkHub{wg: c, ch: make(chan dlPacket, dlQueueSize)}
+	// The resequencer belongs to the GROUP, because a group is exactly the set
+	// of connections that merge — and merging unequal-latency paths is what
+	// shuffles the uplink. A connection on its own private socket has nothing to
+	// merge with and never gets one.
+	if uplinkReseqHold > 0 {
+		h.reseq = newResequencer(c, connect)
+		registerResequencer(h.reseq)
+		log.Printf("downlink hub: uplink resequencer on, hold %s (measured "+
+			"lateness p90 was 6 ms, p99 7-16 ms, max 35 ms)", uplinkReseqHold)
+	}
 	context.AfterFunc(ctx, func() {
+		if h.reseq != nil {
+			// Flush before the socket goes: packets held here have already
+			// crossed the network and dropping them would manufacture the loss
+			// this whole change exists to avoid.
+			h.reseq.close()
+			unregisterResequencer(h.reseq)
+		}
 		_ = c.SetDeadline(time.Now())
 		_ = c.Close()
 	})

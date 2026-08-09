@@ -201,7 +201,13 @@ func (r *connRegistry) dump(dur time.Duration, label string) {
 	}
 
 	// Uplink reordering, over the same interval and from the same one consumer.
-	uplinkReorder.dumpAndReset(time.Now())
+	// Order matters: the merge-point reading first, then what the resequencer
+	// did, then the order WireGuard was actually handed. Read top to bottom the
+	// three lines are the before, the work, and the after.
+	now := time.Now()
+	uplinkReorder.dumpAndReset(now)
+	dumpResequencers()
+	uplinkReorderOut.dumpAndReset(now)
 }
 
 func ratio(max, min int64) string {

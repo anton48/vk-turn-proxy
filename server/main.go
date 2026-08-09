@@ -102,6 +102,18 @@ func main() {
 			"segments arriving displaced, so the inner TCP sits in permanent "+
 			"fast-recovery. Costs a map lookup and a few bit operations per "+
 			"uplink packet; turn it off only to run a control.")
+	reseqHold := flag.Duration("uplink-reseq", 0,
+		"put the client's uplink back in COUNTER order before WireGuard sees "+
+			"it, holding an out-of-order packet up to this long for the gap "+
+			"ahead of it to fill. 0 = off, which is the default and the control. "+
+			"The client stripes one inner flow across N connections of unequal "+
+			"latency, so 73-86% of packets arrive displaced (median depth ~N/2) "+
+			"with ZERO loss — and the inner TCP reads that as loss, answers 69% "+
+			"of its ACKs as duplicates and never leaves fast-recovery. The "+
+			"shuffle is deep in packets but short in time (measured lateness p90 "+
+			"6 ms, p99 7-16 ms, max 35 ms), so 30ms-40ms should catch nearly all "+
+			"of it. Nothing is ever dropped: a packet whose slot has already been "+
+			"released is forwarded late rather than discarded.")
 	logFile := flag.String("logfile", "",
 		"if set, append log output to this file instead of stdout. The "+
 			"file is opened in append mode (O_APPEND|O_CREATE) so logs from "+
@@ -109,6 +121,7 @@ func main() {
 			"the startup banner go through the same writer.")
 	flag.Parse()
 	reorderStatsEnabled = *reorderStats
+	uplinkReseqHold = *reseqHold
 
 	if *logFile != "" {
 		f, err := os.OpenFile(*logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
@@ -581,7 +594,15 @@ func pumpBidirectional(ctx context.Context, conn net.Conn, connect string, singl
 			if b.hub == nil {
 				_ = b.wg.SetWriteDeadline(time.Now().Add(30 * time.Minute))
 			}
-			if _, err1 = b.wg.Write(buf[:n]); err1 != nil {
+			// M5: when the group has a resequencer, WireGuard is reached only
+			// through it, so the order it computes is the order WireGuard sees.
+			// Ungrouped connections do not merge with anything and go direct.
+			if b.hub != nil && b.hub.reseq != nil {
+				err1 = b.hub.reseq.write(buf[:n])
+			} else {
+				_, err1 = b.wg.Write(buf[:n])
+			}
+			if err1 != nil {
 				log.Printf("inbound write failed: %s", err1)
 				return
 			}

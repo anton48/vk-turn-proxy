@@ -122,6 +122,7 @@ func (p *peerSeq) mark(c uint64) (dup bool, stale bool) {
 
 type reorderStats struct {
 	mu    sync.Mutex
+	label string // distinguishes the merge-point reading from the post-fix one
 	peers map[uint32]*peerSeq
 
 	total     int64 // transport packets observed
@@ -136,10 +137,20 @@ type reorderStats struct {
 	maxLate  time.Duration
 }
 
-// uplinkReorder is the single instance, observed from every connection's
-// inbound goroutine and read only by the conn-stats dump. One consumer, because
-// the counters are read-and-reset and two readers would steal from each other.
+// uplinkReorder is measured at the MERGE POINT — the input to whatever we do
+// next, and therefore the disorder the client's fan-out actually produces.
+// Observed from every connection's inbound goroutine and read only by the
+// conn-stats dump: one consumer, because the counters are read-and-reset and
+// two readers would steal from each other.
 var uplinkReorder = &reorderStats{peers: map[uint32]*peerSeq{}}
+
+// uplinkReorderOut is the same measurement on the OUTPUT of the resequencer,
+// i.e. the order WireGuard actually receives. Having both means the log carries
+// before and after on adjacent lines and a fix that does not work cannot hide
+// behind a throughput number that moved for some other reason. It stays at 0
+// packets when the resequencer is off, which is the honest reading of "nothing
+// was done here".
+var uplinkReorderOut = &reorderStats{peers: map[uint32]*peerSeq{}, label: "after reseq"}
 
 // reorderStatsEnabled gates the whole thing so a run can be done without it as
 // a control. On by default: the cost is one map lookup and a few bit operations
@@ -275,9 +286,13 @@ func (s *reorderStats) summaryLocked() string {
 	}
 	share := 100 * float64(s.displaced) / float64(s.total)
 	dh, lh := s.depth[:], s.late[:]
+	tag := "uplink"
+	if s.label != "" {
+		tag = "uplink " + s.label
+	}
 	return fmt.Sprintf(
-		"  reorder(uplink): %d pkts, %.1f%% out-of-order, depth p50/p90/p99/max %d/%d/%d/%d, late p50/p90/p99 %d/%d/%d ms (max %s), dup %d, stale %d, keypairs %d",
-		s.total, share,
+		"  reorder(%s): %d pkts, %.1f%% out-of-order, depth p50/p90/p99/max %d/%d/%d/%d, late p50/p90/p99 %d/%d/%d ms (max %s), dup %d, stale %d, keypairs %d",
+		tag, s.total, share,
 		histPct(dh, s.displaced, 0.50), histPct(dh, s.displaced, 0.90), histPct(dh, s.displaced, 0.99), s.maxDepth,
 		histPct(lh, s.displaced, 0.50), histPct(lh, s.displaced, 0.90), histPct(lh, s.displaced, 0.99),
 		s.maxLate.Round(time.Millisecond),
