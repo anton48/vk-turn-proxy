@@ -172,6 +172,50 @@ func TestUnfilledGapIsReleasedAfterTheHold(t *testing.T) {
 	}
 }
 
+// 🚨 THE TEST THAT WAS MISSING, and whose absence let a real defect ship.
+//
+// The bound must be PER PACKET. The first version released one gap per timer
+// firing and re-armed, so a packet behind K gaps waited K × holdFor — on the
+// device that came out as a mean hold of 98-248 ms under a 30 ms timer. Every
+// test I had passed, because every one of them contained a single gap.
+func TestHoldIsBoundedPerPacketNotPerGap(t *testing.T) {
+	const hold = 50 * time.Millisecond
+	const gaps = 8
+	r, w := newReseq(t, hold)
+
+	start := time.Now()
+	_ = r.write(wgPkt(1, 0)) // released at once
+	// Odd counters are lost forever, so every even one sits behind its own gap.
+	for i := 1; i <= gaps; i++ {
+		_ = r.write(wgPkt(1, uint64(2*i)))
+	}
+	if got := len(w.seen()); got != 1 {
+		t.Fatalf("released %d before the hold expired, want 1", got)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for len(w.seen()) < gaps+1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	elapsed := time.Since(start)
+	got := w.seen()
+	if len(got) != gaps+1 {
+		t.Fatalf("released %d of %d packets", len(got), gaps+1)
+	}
+	// One holdFor plus generous slack for the scheduler. The per-gap bug would
+	// need gaps × hold = 400 ms and land far outside this.
+	if limit := hold + 40*time.Millisecond; elapsed > limit {
+		t.Fatalf("the last packet behind %d gaps waited %s, want under %s — "+
+			"the bound is per gap, not per packet", gaps, elapsed.Round(time.Millisecond), limit)
+	}
+	if inversions(got) != 0 {
+		t.Fatalf("released out of order: %v", got)
+	}
+	if r.maxHold > hold+40*time.Millisecond {
+		t.Fatalf("maxHold = %s, want at most ~%s", r.maxHold, hold)
+	}
+}
+
 // A packet whose slot was already released must be FORWARDED, never dropped:
 // dropping would manufacture exactly the real loss this change exists to avoid.
 func TestLatePacketIsForwardedNotDropped(t *testing.T) {

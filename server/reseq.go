@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"sort"
 	"sync"
 	"time"
 )
@@ -37,8 +38,13 @@ import (
 //     better than dropping it: the hole is already visible to the inner TCP and
 //     a late fill is what SACK wants, whereas a drop would manufacture the real
 //     loss we have spent two days proving does not exist.
-//  2. The wait is bounded by holdFor, and separately by maxHeld packets. Neither
-//     bound can be exceeded even if the client stops sending.
+//  2. The wait is bounded PER PACKET by holdFor, and separately by maxHeld.
+//     🚨 The first version of this file bounded it per GAP instead — on expiry
+//     it stepped past one gap and re-armed, so a packet behind K gaps waited
+//     K x holdFor. Measured on the first run: mean hold 98-248 ms against a
+//     30 ms timer, with 36-66 timeouts per 2 s tick. The header then claimed
+//     "the wait is bounded by holdFor", which was simply untrue as written.
+//     The instrument caught it, not review. Deadlines are now per packet.
 //  3. Only transport messages are held. Handshakes carry no counter and are
 //     passed straight through — delaying a handshake could break the session,
 //     and there are too few of them to matter anyway.
@@ -65,6 +71,11 @@ const (
 	// measured p99 depth of ~320 packets this is generous; when it is hit the
 	// oldest gap is abandoned immediately rather than waiting for holdFor.
 	reseqMaxHeld = 2048
+
+	// Hold time is reported as a distribution, not just a mean. The defect that
+	// made this necessary hid behind a 3.2 ms mean in one phase while the other
+	// phase sat at 191 ms.
+	reseqHoldBuckets = 512 // milliseconds, plus one overflow bucket
 )
 
 // uplinkReseqHold is the hold timer. Zero disables the resequencer entirely,
@@ -93,6 +104,8 @@ type resequencer struct {
 	overflows  int64 // gaps abandoned because maxHeld was reached
 	lateBypass int64 // arrived after its slot was released — written anyway
 	holdNs     int64 // total time packets spent held
+	holdMs     [reseqHoldBuckets + 1]int64 // so the TAIL is visible, not just the mean
+	maxHold    time.Duration
 	maxHeldObs int
 }
 
@@ -159,7 +172,7 @@ func (r *resequencer) write(pkt []byte) error {
 		r.overflows++
 		r.skipToLowestLocked()
 	}
-	r.armLocked()
+	r.armLocked(time.Now(), true)
 	return nil
 }
 
@@ -168,15 +181,55 @@ func (r *resequencer) drainLocked() {
 	for {
 		buf, ok := r.held[r.next]
 		if !ok {
-			return
+			break
 		}
 		if t, ok := r.heldAt[r.next]; ok {
-			r.holdNs += int64(time.Since(t))
+			d := time.Since(t)
+			r.holdNs += int64(d)
+			if d > r.maxHold {
+				r.maxHold = d
+			}
+			ms := int(d / time.Millisecond)
+			if ms > reseqHoldBuckets {
+				ms = reseqHoldBuckets
+			}
+			r.holdMs[ms]++
 			delete(r.heldAt, r.next)
 		}
 		delete(r.held, r.next)
 		_ = r.writeLocked(buf)
 		r.next++
+	}
+	if len(r.held) == 0 {
+		r.stopLocked()
+	}
+}
+
+// releaseExpiredLocked frees every packet that has waited its full holdFor,
+// stepping past ALL the gaps that implies rather than one per timer firing.
+// That distinction is the whole fix: bounding the wait per gap composes into
+// K x holdFor for a packet behind K gaps, which is what put the mean hold at
+// 98-248 ms under a 30 ms timer.
+func (r *resequencer) releaseExpiredLocked(now time.Time) {
+	var expired []uint64
+	for c, t := range r.heldAt {
+		if now.Sub(t) >= uplinkReseqHold {
+			expired = append(expired, c)
+		}
+	}
+	if len(expired) == 0 {
+		return
+	}
+	sort.Slice(expired, func(i, j int) bool { return expired[i] < expired[j] })
+	for _, c := range expired {
+		if _, still := r.held[c]; !still {
+			continue // already went out as part of an earlier contiguous run
+		}
+		if c > r.next {
+			r.next = c
+			r.timeouts++
+		}
+		r.drainLocked()
 	}
 }
 
@@ -205,12 +258,35 @@ func (r *resequencer) flushAllLocked() {
 	r.stopLocked()
 }
 
-// armLocked keeps exactly one pending timer while anything is held.
-func (r *resequencer) armLocked() {
-	if r.timer != nil || len(r.held) == 0 {
+// armLocked keeps one pending timer aimed at the OLDEST held packet's deadline.
+//
+// On insert the caller passes fresh=true: a newly held packet is by definition
+// the newest, so it can never move the deadline, and re-arming would be both
+// wasteful and wrong. The only case that needs a new timer there is the one
+// where nothing was held at all — which drainLocked guarantees by stopping the
+// timer whenever the buffer empties.
+func (r *resequencer) armLocked(now time.Time, fresh bool) {
+	if len(r.held) == 0 {
+		r.stopLocked()
 		return
 	}
-	r.timer = time.AfterFunc(uplinkReseqHold, r.onTimeout)
+	if fresh && r.timer != nil {
+		return
+	}
+	oldest := now
+	for _, t := range r.heldAt {
+		if t.Before(oldest) {
+			oldest = t
+		}
+	}
+	d := uplinkReseqHold - now.Sub(oldest)
+	if d < time.Millisecond {
+		d = time.Millisecond
+	}
+	if r.timer != nil {
+		r.timer.Stop()
+	}
+	r.timer = time.AfterFunc(d, r.onTimeout)
 }
 
 func (r *resequencer) stopLocked() {
@@ -227,9 +303,9 @@ func (r *resequencer) onTimeout() {
 	if len(r.held) == 0 {
 		return
 	}
-	r.timeouts++
-	r.skipToLowestLocked()
-	r.armLocked()
+	now := time.Now()
+	r.releaseExpiredLocked(now)
+	r.armLocked(now, false)
 }
 
 // writeLocked is the single point where anything reaches WireGuard, which is
@@ -269,13 +345,22 @@ func (r *resequencer) summaryAndReset() string {
 	if held > 0 {
 		mean = time.Duration(r.holdNs / held)
 	}
+	// ⚠️ The mean alone hid the per-gap defect: it read 3.2 ms in the download
+	// phase of the very run where the upload phase sat at 191 ms. Report the
+	// tail, and report the maximum, because that is where a broken bound shows.
 	s := fmt.Sprintf(
-		"  reseq[%s]: %d pkts, %.1f%% already in order, %d held (mean %s, peak %d), timeouts %d, overflow %d, late-bypass %d",
-		r.name, r.total, pct, held, mean.Round(100*time.Microsecond), r.maxHeldObs,
+		"  reseq[%s]: %d pkts, %.1f%% already in order, %d held (hold mean %s p50/p90/p99 %d/%d/%d ms max %s, peak %d), timeouts %d, overflow %d, late-bypass %d",
+		r.name, r.total, pct, held,
+		mean.Round(100*time.Microsecond),
+		histPct(r.holdMs[:], held, 0.50), histPct(r.holdMs[:], held, 0.90), histPct(r.holdMs[:], held, 0.99),
+		r.maxHold.Round(time.Millisecond), r.maxHeldObs,
 		r.timeouts, r.overflows, r.lateBypass)
 	r.total, r.passed, r.buffered = 0, 0, 0
 	r.timeouts, r.overflows, r.lateBypass = 0, 0, 0
-	r.holdNs, r.maxHeldObs = 0, 0
+	r.holdNs, r.maxHeldObs, r.maxHold = 0, 0, 0
+	for i := range r.holdMs {
+		r.holdMs[i] = 0
+	}
 	return s
 }
 
