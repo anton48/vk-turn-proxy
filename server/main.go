@@ -94,12 +94,21 @@ func main() {
 			"computed over 60s are not the shares during the download burst. "+
 			"Drop this to 2s-5s when measuring, and read the logged KB/s "+
 			"directly rather than deriving rates from shares.")
+	reorderStats := flag.Bool("reorder-stats", true,
+		"measure how badly the client's connections deliver its uplink out of "+
+			"order, using WireGuard's cleartext per-packet counter, and report "+
+			"it alongside conn-stats. This is the CAUSE of the upload problem "+
+			"measured on 2026-08-09: zero real loss but 74% of inner TCP "+
+			"segments arriving displaced, so the inner TCP sits in permanent "+
+			"fast-recovery. Costs a map lookup and a few bit operations per "+
+			"uplink packet; turn it off only to run a control.")
 	logFile := flag.String("logfile", "",
 		"if set, append log output to this file instead of stdout. The "+
 			"file is opened in append mode (O_APPEND|O_CREATE) so logs from "+
 			"multiple restarts accumulate. Both the standard log.* calls and "+
 			"the startup banner go through the same writer.")
 	flag.Parse()
+	reorderStatsEnabled = *reorderStats
 
 	if *logFile != "" {
 		f, err := os.OpenFile(*logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
@@ -559,6 +568,12 @@ func pumpBidirectional(ctx context.Context, conn net.Conn, connect string, singl
 				}
 				continue
 			}
+			// Measured HERE, at the merge point, because this is where the
+			// client's N connections become one stream — the displacement a
+			// packet has at this instant is exactly what the fan-out did to it,
+			// and what the inner TCP downstream will read as loss.
+			uplinkReorder.observe(buf[:n], time.Now())
+
 			b := bind.Load()
 			// A shared socket carries every connection's uplink, so a write
 			// deadline set here would apply to all of them — skip it in group

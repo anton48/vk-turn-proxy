@@ -199,6 +199,9 @@ func (r *connRegistry) dump(dur time.Duration, label string) {
 			time.Duration(paceNs).Round(time.Millisecond),
 			mean.Round(10*time.Microsecond))
 	}
+
+	// Uplink reordering, over the same interval and from the same one consumer.
+	uplinkReorder.dumpAndReset(time.Now())
 }
 
 func ratio(max, min int64) string {
