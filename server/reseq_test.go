@@ -2,6 +2,8 @@ package main
 
 import (
 	"math/rand"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -361,6 +363,60 @@ func TestConcurrentWritersKeepOrderAndLoseNothing(t *testing.T) {
 	// Not asserting zero inversions: the workers race, so the ORDER OF ARRIVAL
 	// is genuinely non-deterministic and some packets legitimately arrive after
 	// their slot expired. The invariant that must hold is conservation.
+}
+
+// 🚨 A percentile must be normalised by the thing it is a percentile OF.
+//
+// `buffered` counts packets going IN to the hold buffer; the hold histogram is
+// filled when they come OUT. At every interval boundary the difference is
+// whatever is still held — so dividing by `buffered` walked the cumulative off
+// the end of the histogram and printed the OVERFLOW bucket. A device run showed
+// "p99 512 ms" next to "max 31ms", and only that impossibility caught it.
+//
+// The case below is the extreme of it: everything is still held, so the
+// histogram is empty and the honest answer is "no data", not 512.
+func TestHoldPercentilesAreNormalisedByReleasedPacketsNotBuffered(t *testing.T) {
+	r, _ := newReseq(t, time.Hour) // nothing will be released by a timer
+	_ = r.write(wgPkt(1, 0))       // straight through, never buffered
+	for i := uint64(2); i <= 40; i++ {
+		_ = r.write(wgPkt(1, i)) // all held behind the gap at 1
+	}
+	if r.buffered != 39 {
+		t.Fatalf("buffered = %d, want 39", r.buffered)
+	}
+	line := r.summaryAndReset()
+	for _, bad := range []string{"512", strconv.Itoa(reseqHoldBuckets)} {
+		if strings.Contains(line, bad+"/") || strings.Contains(line, "/"+bad+" ms") {
+			t.Fatalf("percentile fell into the overflow bucket: %q", line)
+		}
+	}
+	if !strings.Contains(line, "-1/-1/-1 ms") {
+		t.Fatalf("with nothing released the percentiles must report no data, got %q", line)
+	}
+	if !strings.Contains(line, "over 0 released") {
+		t.Fatalf("the line must say how many packets the hold stats cover: %q", line)
+	}
+	r.close()
+}
+
+// And the ordinary case: released packets are summarised over themselves.
+func TestHoldPercentilesCoverTheReleasedPackets(t *testing.T) {
+	r, _ := newReseq(t, time.Hour)
+	_ = r.write(wgPkt(1, 0))
+	for i := uint64(1); i <= 20; i++ {
+		_ = r.write(wgPkt(1, i)) // arrives in order after the first — nothing held
+	}
+	// Now hold three behind a gap, then fill it so they drain.
+	for _, c := range []uint64{23, 24, 25} {
+		_ = r.write(wgPkt(1, c))
+	}
+	_ = r.write(wgPkt(1, 21))
+	_ = r.write(wgPkt(1, 22))
+	line := r.summaryAndReset()
+	if !strings.Contains(line, "over 3 released") {
+		t.Fatalf("want 3 released packets in the hold stats: %q", line)
+	}
+	r.close()
 }
 
 func TestSummaryLineAndReset(t *testing.T) {

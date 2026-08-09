@@ -341,19 +341,37 @@ func (r *resequencer) summaryAndReset() string {
 	}
 	held := r.buffered
 	pct := 100 * float64(r.passed) / float64(r.total)
+	// histN is the number of packets that actually CAME OUT of the buffer in
+	// this interval, which is what every hold statistic is a statistic of.
+	// `held` counts the ones that went IN, and the two differ by whatever is
+	// still held at the boundary.
+	var histN int64
+	for _, c := range r.holdMs {
+		histN += c
+	}
 	mean := time.Duration(0)
-	if held > 0 {
-		mean = time.Duration(r.holdNs / held)
+	if histN > 0 {
+		mean = time.Duration(r.holdNs / histN)
 	}
 	// ⚠️ The mean alone hid the per-gap defect: it read 3.2 ms in the download
 	// phase of the very run where the upload phase sat at 191 ms. Report the
 	// tail, and report the maximum, because that is where a broken bound shows.
+	//
+	// 🚨 NORMALISE THE PERCENTILES BY THE HISTOGRAM'S OWN SUM, not by `held`.
+	// A packet is counted in `buffered` when it goes IN and in the histogram
+	// when it comes OUT, so at every interval boundary the packets still held
+	// are in one and not the other. Dividing by `held` therefore made the
+	// cumulative walk run off the end into the overflow bucket, and a device
+	// run printed "p99 512 ms" beside "max 31ms" — the two cannot both be true,
+	// which is the only reason it was caught. THIRD wrong-denominator statistic
+	// in two days; the rule is that a percentile is normalised by the thing it
+	// is a percentile OF.
 	s := fmt.Sprintf(
-		"  reseq[%s]: %d pkts, %.1f%% already in order, %d held (hold mean %s p50/p90/p99 %d/%d/%d ms max %s, peak %d), timeouts %d, overflow %d, late-bypass %d",
+		"  reseq[%s]: %d pkts, %.1f%% already in order, %d held (hold mean %s p50/p90/p99 %d/%d/%d ms max %s over %d released, peak %d), timeouts %d, overflow %d, late-bypass %d",
 		r.name, r.total, pct, held,
 		mean.Round(100*time.Microsecond),
-		histPct(r.holdMs[:], held, 0.50), histPct(r.holdMs[:], held, 0.90), histPct(r.holdMs[:], held, 0.99),
-		r.maxHold.Round(time.Millisecond), r.maxHeldObs,
+		histPct(r.holdMs[:], histN, 0.50), histPct(r.holdMs[:], histN, 0.90), histPct(r.holdMs[:], histN, 0.99),
+		r.maxHold.Round(time.Millisecond), histN, r.maxHeldObs,
 		r.timeouts, r.overflows, r.lateBypass)
 	r.total, r.passed, r.buffered = 0, 0, 0
 	r.timeouts, r.overflows, r.lateBypass = 0, 0, 0
