@@ -17,71 +17,99 @@ import (
 // where they merge the stream is shuffled: 74.2% of inner TCP segments arrive
 // displaced (server2 capture, TCP sequence space) and 72.5-79.1% of WireGuard
 // packets do (server1, reorder.go, counter space) — median depth ~N/2. There is
-// NO loss: every one of the 113 retransmissions in the capture was spurious.
-// What the shuffle costs is the congestion window — the receiver answers 69.3%
-// of its ACKs as duplicate ACKs and the sender never leaves fast-recovery.
+// NO loss: every retransmission observed was spurious.
 //
-// WireGuard itself does not care: its replay window is 8128 packets and accepts
-// all of this. It also does not FIX it — it hands packets to the TUN in arrival
-// order, so the inner TCP inherits the shuffle whole.
+// 🎯 WHAT IT IS WORTH, measured 2026-08-10 with iperf3, ONE stream, nothing
+// varying but the hold: off **2.95** → 30 ms **4.93** → 100 ms **9.46** →
+// 150 ms **13.0 Mbit/s**. Monotone, 4.4×. The same phone does 73.0 Mbit/s
+// single-stream with no VPN, so reordering — not path length — was the cost.
 //
-// THE SHAPE OF THE FIX comes from the measurement, not from taste. The shuffle
-// is deep in packets but SHORT IN TIME: lateness p50 0 ms, p90 6 ms, p99 7-16,
-// max 35 over a whole run. So a small hold buffer keyed on WireGuard's own
-// counter recovers order at a cost of tens of milliseconds, and only for packets
-// that actually arrive early — an in-order packet is written through untouched.
+// ⚠️ AND WHAT IT IS NOT WORTH YET. On a MULTI-stream workload it makes things
+// worse (Ookla at 100 ms: 12.2 against 16-26 without), because that workload
+// sits on a SECOND, still-unexplained limit — an aggregate ~22-26 Mbit/s
+// reached at ~8 flows — where a per-flow gain cannot appear. Default stays 0.
+//
+// WireGuard tolerates the shuffle (replay window 8128) but does not repair it:
+// it hands packets to the TUN in arrival order, so the inner TCP inherits it.
 //
 // 🚨 WHY THIS CANNOT LOSE DATA. Three rules, in order of importance:
 //
-//  1. A packet is never dropped. One that arrives after its slot was already
-//     released is written through immediately, out of order. That is strictly
-//     better than dropping it: the hole is already visible to the inner TCP and
-//     a late fill is what SACK wants, whereas a drop would manufacture the real
-//     loss we have spent two days proving does not exist.
-//  2. The wait is bounded PER PACKET by holdFor, and separately by maxHeld.
-//     🚨 The first version of this file bounded it per GAP instead — on expiry
-//     it stepped past one gap and re-armed, so a packet behind K gaps waited
-//     K x holdFor. Measured on the first run: mean hold 98-248 ms against a
-//     30 ms timer, with 36-66 timeouts per 2 s tick. The header then claimed
-//     "the wait is bounded by holdFor", which was simply untrue as written.
-//     The instrument caught it, not review. Deadlines are now per packet.
-//  3. Only transport messages are held. Handshakes carry no counter and are
-//     passed straight through — delaying a handshake could break the session,
-//     and there are too few of them to matter anyway.
+//  1. A packet is never dropped. One that arrives after its slot was released
+//     is written through immediately, out of order. That is strictly better
+//     than dropping it: the hole is already visible to the inner TCP and a late
+//     fill is what SACK wants, whereas a drop would manufacture real loss.
+//  2. The wait is bounded per packet by reseqMaxWaitFactor × holdFor, and
+//     separately by maxHeld packets.
+//  3. Only transport messages are held. Handshakes carry no counter and pass
+//     straight through — delaying one could break the session.
 //
-// ⚠️ THERE IS A STARTUP TRANSIENT, and it is unavoidable. The first transport
-// packet seen defines where the sequence starts, so any packet with a LOWER
-// counter that arrives afterwards has missed its slot and is forwarded out of
-// order. The transient is bounded by the reorder depth — a couple of dozen
-// packets once per keypair — because nothing older than that is still in
-// flight. Knowing the true first counter would require state we do not have and
-// would buy a few packets at the start of a two-minute epoch.
-//
-// ⚠️ REKEY. The counter restarts at zero under a new receiver index roughly
-// every two minutes. State is therefore keyed by index: a new one flushes what
-// is held, in order, and starts a fresh sequence. Sharing state across a rekey
-// would read as a four-billion-packet jump backwards.
+// ⚠️ THERE IS A STARTUP TRANSIENT per generation, and it is unavoidable. The
+// first transport packet of a keypair defines where its sequence starts, so a
+// packet with a LOWER counter arriving afterwards has missed its slot. Bounded
+// by the reorder depth, once per keypair.
 //
 // The resequencer lives on the GROUP's hub, because a group is exactly the set
 // of connections that merge. A connection with its own private socket has
 // nothing to merge with and is left alone.
 
 const (
-	// maxHeld bounds both memory and the damage a stuck sequence can do. At the
-	// measured p99 depth of ~320 packets this is generous; when it is hit the
-	// oldest gap is abandoned immediately rather than waiting for holdFor.
+	// maxHeld bounds memory and the damage a stuck sequence can do, across all
+	// live generations together.
 	reseqMaxHeld = 2048
 
 	// Hold time is reported as a distribution, not just a mean. The defect that
-	// made this necessary hid behind a 3.2 ms mean in one phase while the other
-	// phase sat at 191 ms.
+	// made that necessary hid behind a 3.2 ms mean in one phase while another
+	// phase of the same run sat at 191 ms.
 	reseqHoldBuckets = 512 // milliseconds, plus one overflow bucket
+
+	// A packet may wait this many holdFor before the safety valve opens and the
+	// current gap is abandoned wholesale. Without it, a run of genuinely missing
+	// counters would cost holdFor EACH — see waitForHoleLocked.
+	reseqMaxWaitFactor = 3
+
+	// At most this many keypairs are tracked at once. Two is the real number
+	// (old + new across a rekey); a third means something is wrong and the
+	// oldest is force-closed rather than accumulating.
+	reseqMaxGens = 3
 )
 
-// uplinkReseqHold is the hold timer. Zero disables the resequencer entirely,
-// which is the default — this is a treatment, and a run without it is the
-// control that says whether it did anything.
+// uplinkReseqHold is the hold timer from the command line. Zero disables the
+// resequencer entirely, which is the default — this is a treatment, and a run
+// without it is the control that says whether it did anything.
 var uplinkReseqHold time.Duration
+
+// generation is one keypair's counter sequence.
+//
+// 🚨 WHY GENERATIONS EXIST. WireGuard rekeys about every two minutes and the
+// counter restarts at zero under a NEW receiver index. During the switch the
+// client's N connections carry BOTH keypairs for a while, so a single "current
+// index" thrashes: every packet of the other keypair resets the sequence. The
+// first version did exactly that and produced a 4.855 s hold against a 150 ms
+// bound, with output displacement p50 1024 and max 5572 — once per rekey.
+//
+// Generations also fix an ordering point that a single index cannot express:
+// the sender switches keypairs at an instant, so EVERY old-keypair packet
+// precedes every new-keypair one in the inner stream. Emitting strictly from
+// the oldest open generation preserves that; a bare per-index map would not.
+type generation struct {
+	idx       uint32
+	next      uint64               // the counter we are waiting for
+	held      map[uint64][]byte    // counters above next
+	heldAt    map[uint64]time.Time // arrival time, for the hold statistics
+	holeSince time.Time            // when we started waiting for `next`
+	lastSeen  time.Time            // last packet of this keypair
+	started   bool
+}
+
+func newGeneration(idx uint32, ctr uint64, now time.Time) *generation {
+	return &generation{
+		idx: idx, next: ctr, started: true,
+		held:      map[uint64][]byte{},
+		heldAt:    map[uint64]time.Time{},
+		holeSince: now,
+		lastSeen:  now,
+	}
+}
 
 // resequencer restores counter order for one group of connections.
 type resequencer struct {
@@ -89,32 +117,35 @@ type resequencer struct {
 	w    io.Writer
 	name string
 
-	idx     uint32 // receiver index of the keypair being tracked
-	haveIdx bool
-	next    uint64 // the counter we are waiting for
-	held    map[uint64][]byte
-	heldAt  map[uint64]time.Time // arrival time, so the mean hold is measured
-	timer   *time.Timer
+	// gens is ordered oldest-first. Only gens[0] emits; later generations hold
+	// until it closes, because their packets are later in the inner stream.
+	hold  time.Duration // captured at construction; never read from a global
+	gens  []*generation
+	timer *time.Timer
 
 	// Interval counters, read and reset by the conn-stats dump.
 	total      int64 // transport packets seen
 	passed     int64 // already in order, written straight through
 	buffered   int64 // held at least momentarily
-	timeouts   int64 // gaps abandoned because holdFor expired
+	timeouts   int64 // holes given up on after holdFor
+	valves     int64 // gaps abandoned wholesale by the safety valve
 	overflows  int64 // gaps abandoned because maxHeld was reached
+	rekeys     int64 // generations opened after the first
 	lateBypass int64 // arrived after its slot was released — written anyway
 	holdNs     int64 // total time packets spent held
-	holdMs     [reseqHoldBuckets + 1]int64 // so the TAIL is visible, not just the mean
+	holdMs     [reseqHoldBuckets + 1]int64
 	maxHold    time.Duration
 	maxHeldObs int
 }
 
-func newResequencer(w io.Writer, name string) *resequencer {
-	return &resequencer{
-		w: w, name: name,
-		held:   map[uint64][]byte{},
-		heldAt: map[uint64]time.Time{},
-	}
+// newResequencer captures the hold ONCE, at construction.
+//
+// ⚠️ It used to read the global on every timer firing, which is a data race
+// waiting for anyone who writes that global — the test harness did, and the
+// race detector caught it. A timer goroutine should not read state it does not
+// own.
+func newResequencer(w io.Writer, name string, hold time.Duration) *resequencer {
+	return &resequencer{w: w, name: name, hold: hold}
 }
 
 // write takes one uplink packet on its way to WireGuard. It returns the error
@@ -128,118 +159,154 @@ func (r *resequencer) write(pkt []byte) error {
 	}
 	idx := binary.LittleEndian.Uint32(pkt[4:8])
 	ctr := binary.LittleEndian.Uint64(pkt[8:16])
+	now := time.Now()
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.total++
 
-	if !r.haveIdx || r.idx != idx {
-		// New keypair. Flush what is held for the old one, in order, then start
-		// this sequence at the counter in hand.
-		r.flushAllLocked()
-		r.idx, r.haveIdx = idx, true
-		r.next = ctr
+	g := r.genLocked(idx, ctr, now)
+	g.lastSeen = now
+
+	// Only the oldest generation may emit. A newer one buffers until the older
+	// closes, which is what keeps the two sides of a rekey in order.
+	if g != r.gens[0] {
+		r.holdLocked(g, ctr, pkt, now)
+		r.armLocked(now)
+		return nil
 	}
 
 	switch {
-	case ctr < r.next:
-		// Its slot is gone. Forward rather than drop — see rule 1.
+	case ctr < g.next:
+		// Its slot is gone. Forward rather than drop — rule 1.
 		r.lateBypass++
 		return r.writeLocked(pkt)
 
-	case ctr == r.next:
+	case ctr == g.next:
 		r.passed++
 		if err := r.writeLocked(pkt); err != nil {
 			return err
 		}
-		r.next++
-		r.drainLocked()
+		g.next++
+		g.holeSince = now
+		r.drainLocked(g)
+		r.armLocked(now)
 		return nil
 	}
 
-	// Early: hold it until the gap fills, the timer fires, or the buffer fills.
-	r.buffered++
-	cp := make([]byte, len(pkt))
-	copy(cp, pkt)
-	if _, dup := r.held[ctr]; !dup {
-		r.heldAt[ctr] = time.Now()
-	}
-	r.held[ctr] = cp
-	if n := len(r.held); n > r.maxHeldObs {
-		r.maxHeldObs = n
-	}
-	if len(r.held) > reseqMaxHeld {
+	r.holdLocked(g, ctr, pkt, now)
+	if r.heldCountLocked() > reseqMaxHeld {
 		r.overflows++
-		r.skipToLowestLocked()
+		r.abandonGapLocked(g, now)
 	}
-	r.armLocked(time.Now(), true)
+	r.armLocked(now)
 	return nil
 }
 
-// drainLocked releases every packet that has become contiguous.
-func (r *resequencer) drainLocked() {
+// genLocked finds or creates the generation for a receiver index.
+func (r *resequencer) genLocked(idx uint32, ctr uint64, now time.Time) *generation {
+	for _, g := range r.gens {
+		if g.idx == idx {
+			return g
+		}
+	}
+	if len(r.gens) > 0 {
+		r.rekeys++
+	}
+	g := newGeneration(idx, ctr, now)
+	r.gens = append(r.gens, g)
+	// More than two live keypairs is not a thing WireGuard does; force-close the
+	// oldest rather than let the list grow.
+	for len(r.gens) > reseqMaxGens {
+		r.closeOldestLocked()
+	}
+	return g
+}
+
+func (r *resequencer) holdLocked(g *generation, ctr uint64, pkt []byte, now time.Time) {
+	r.buffered++
+	cp := make([]byte, len(pkt))
+	copy(cp, pkt)
+	if _, dup := g.held[ctr]; !dup {
+		g.heldAt[ctr] = now
+	}
+	g.held[ctr] = cp
+	if n := r.heldCountLocked(); n > r.maxHeldObs {
+		r.maxHeldObs = n
+	}
+}
+
+func (r *resequencer) heldCountLocked() int {
+	n := 0
+	for _, g := range r.gens {
+		n += len(g.held)
+	}
+	return n
+}
+
+// drainLocked releases every packet of g that has become contiguous.
+func (r *resequencer) drainLocked(g *generation) {
 	for {
-		buf, ok := r.held[r.next]
+		buf, ok := g.held[g.next]
 		if !ok {
 			break
 		}
-		if t, ok := r.heldAt[r.next]; ok {
-			d := time.Since(t)
-			r.holdNs += int64(d)
-			if d > r.maxHold {
-				r.maxHold = d
-			}
-			ms := int(d / time.Millisecond)
-			if ms > reseqHoldBuckets {
-				ms = reseqHoldBuckets
-			}
-			r.holdMs[ms]++
-			delete(r.heldAt, r.next)
+		if t, ok := g.heldAt[g.next]; ok {
+			r.recordHold(time.Since(t))
+			delete(g.heldAt, g.next)
 		}
-		delete(r.held, r.next)
+		delete(g.held, g.next)
 		_ = r.writeLocked(buf)
-		r.next++
-	}
-	if len(r.held) == 0 {
-		r.stopLocked()
+		g.next++
 	}
 }
 
-// releaseExpiredLocked frees every packet that has waited its full holdFor,
-// stepping past ALL the gaps that implies rather than one per timer firing.
-// That distinction is the whole fix: bounding the wait per gap composes into
-// K x holdFor for a packet behind K gaps, which is what put the mean hold at
-// 98-248 ms under a 30 ms timer.
-func (r *resequencer) releaseExpiredLocked(now time.Time) {
-	var expired []uint64
-	for c, t := range r.heldAt {
-		if now.Sub(t) >= uplinkReseqHold {
-			expired = append(expired, c)
-		}
+func (r *resequencer) recordHold(d time.Duration) {
+	r.holdNs += int64(d)
+	if d > r.maxHold {
+		r.maxHold = d
 	}
-	if len(expired) == 0 {
+	ms := int(d / time.Millisecond)
+	if ms < 0 {
+		ms = 0
+	}
+	if ms > reseqHoldBuckets {
+		ms = reseqHoldBuckets
+	}
+	r.holdMs[ms]++
+}
+
+// waitForHoleLocked is the second fix, and the reason the timer semantics
+// changed.
+//
+// 🚨 The first version expired a HELD PACKET and, to release it, declared every
+// counter between `next` and that packet lost in one step. With a reorder depth
+// of 200-650 that abandoned hundreds of slots at once, and the packets filling
+// them — which the input measurement showed arriving only ~15 ms late, far
+// inside the hold — then had to be forwarded out of order. That is where
+// `late-bypass 212` and an OUTPUT displacement of p50 185 came from: the
+// resequencer manufacturing the very disorder it exists to remove.
+//
+// The deadline belongs to the HOLE, not to the packets queued behind it. One
+// missing counter is given up per expiry, and the next hole starts its own
+// clock — so a straggler only has to beat holdFor for ITS counter, not for
+// whatever happens to be held above it.
+func (r *resequencer) waitForHoleLocked(g *generation, now time.Time) {
+	if now.Sub(g.holeSince) < r.hold {
 		return
 	}
-	sort.Slice(expired, func(i, j int) bool { return expired[i] < expired[j] })
-	for _, c := range expired {
-		if _, still := r.held[c]; !still {
-			continue // already went out as part of an earlier contiguous run
-		}
-		if c > r.next {
-			r.next = c
-			r.timeouts++
-		}
-		r.drainLocked()
-	}
+	r.timeouts++
+	g.next++
+	g.holeSince = now
+	r.drainLocked(g)
 }
 
-// skipToLowestLocked abandons the current gap: it advances to the lowest held
-// counter and drains from there. The abandoned packets are not lost — they were
-// never received.
-func (r *resequencer) skipToLowestLocked() {
-	lowest := uint64(0)
-	first := true
-	for c := range r.held {
+// abandonGapLocked is the safety valve: skip straight to the lowest held
+// counter. Without it a run of genuinely missing counters would cost holdFor
+// EACH, so a client that stops mid-sequence could stall the group for seconds.
+func (r *resequencer) abandonGapLocked(g *generation, now time.Time) {
+	lowest, first := uint64(0), true
+	for c := range g.held {
 		if first || c < lowest {
 			lowest, first = c, false
 		}
@@ -247,39 +314,52 @@ func (r *resequencer) skipToLowestLocked() {
 	if first {
 		return
 	}
-	r.next = lowest
-	r.drainLocked()
-}
-
-func (r *resequencer) flushAllLocked() {
-	for len(r.held) > 0 {
-		r.skipToLowestLocked()
+	if lowest > g.next {
+		g.next = lowest
 	}
-	r.stopLocked()
+	g.holeSince = now
+	r.drainLocked(g)
 }
 
-// armLocked keeps one pending timer aimed at the OLDEST held packet's deadline.
-//
-// On insert the caller passes fresh=true: a newly held packet is by definition
-// the newest, so it can never move the deadline, and re-arming would be both
-// wasteful and wrong. The only case that needs a new timer there is the one
-// where nothing was held at all — which drainLocked guarantees by stopping the
-// timer whenever the buffer empties.
-func (r *resequencer) armLocked(now time.Time, fresh bool) {
-	if len(r.held) == 0 {
+// oldestDeadlineLocked returns the earliest moment at which anything needs
+// attention, and whether there is any.
+func (r *resequencer) oldestDeadlineLocked() (time.Time, bool) {
+	var best time.Time
+	found := false
+	consider := func(t time.Time) {
+		if !found || t.Before(best) {
+			best, found = t, true
+		}
+	}
+	for i, g := range r.gens {
+		if len(g.held) == 0 && i == 0 {
+			continue
+		}
+		if i == 0 {
+			// The hole clock, plus the per-packet safety valve.
+			consider(g.holeSince.Add(r.hold))
+			for _, t := range g.heldAt {
+				consider(t.Add(reseqMaxWaitFactor * r.hold))
+			}
+			continue
+		}
+		// A newer generation is blocked on the older one closing.
+		consider(g.lastSeen.Add(r.hold))
+	}
+	// The oldest generation closes once it has been quiet for a hold.
+	if len(r.gens) > 1 {
+		consider(r.gens[0].lastSeen.Add(r.hold))
+	}
+	return best, found
+}
+
+func (r *resequencer) armLocked(now time.Time) {
+	deadline, ok := r.oldestDeadlineLocked()
+	if !ok {
 		r.stopLocked()
 		return
 	}
-	if fresh && r.timer != nil {
-		return
-	}
-	oldest := now
-	for _, t := range r.heldAt {
-		if t.Before(oldest) {
-			oldest = t
-		}
-	}
-	d := uplinkReseqHold - now.Sub(oldest)
+	d := deadline.Sub(now)
 	if d < time.Millisecond {
 		d = time.Millisecond
 	}
@@ -300,12 +380,57 @@ func (r *resequencer) onTimeout() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.timer = nil
-	if len(r.held) == 0 {
+	if len(r.gens) == 0 {
 		return
 	}
 	now := time.Now()
-	r.releaseExpiredLocked(now)
-	r.armLocked(now, false)
+
+	// A generation older than the current one closes once it has gone quiet;
+	// only then may the next one start emitting, which is what preserves order
+	// across a rekey.
+	for len(r.gens) > 1 && now.Sub(r.gens[0].lastSeen) >= r.hold {
+		r.closeOldestLocked()
+	}
+
+	g := r.gens[0]
+	// Safety valve first: any packet that has waited far too long ends the gap
+	// wholesale, so the per-packet bound survives a genuinely missing run.
+	for _, t := range g.heldAt {
+		if now.Sub(t) >= reseqMaxWaitFactor*r.hold {
+			r.valves++
+			r.abandonGapLocked(g, now)
+			break
+		}
+	}
+	r.waitForHoleLocked(g, now)
+	r.armLocked(now)
+}
+
+// closeOldestLocked flushes the oldest generation in counter order and drops it.
+func (r *resequencer) closeOldestLocked() {
+	if len(r.gens) == 0 {
+		return
+	}
+	g := r.gens[0]
+	keys := make([]uint64, 0, len(g.held))
+	for c := range g.held {
+		keys = append(keys, c)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	for _, c := range keys {
+		if t, ok := g.heldAt[c]; ok {
+			r.recordHold(time.Since(t))
+		}
+		_ = r.writeLocked(g.held[c])
+	}
+	r.gens = r.gens[1:]
+	// 🚨 The promoted generation must be DRAINED at once. While it was queued
+	// behind an older one every packet was held, including the one equal to its
+	// own `next` — so without this its first packet sits below the watermark
+	// forever and is stranded. Caught by the rekey-ordering test.
+	if len(r.gens) > 0 {
+		r.drainLocked(r.gens[0])
+	}
 }
 
 // writeLocked is the single point where anything reaches WireGuard, which is
@@ -325,12 +450,15 @@ func (r *resequencer) passthrough(pkt []byte) error {
 	return r.writeLocked(pkt)
 }
 
-// close releases anything still held, so a group teardown does not swallow
+// close releases everything still held, so a group teardown does not swallow
 // packets that had already crossed the network.
 func (r *resequencer) close() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.flushAllLocked()
+	for len(r.gens) > 0 {
+		r.closeOldestLocked()
+	}
+	r.stopLocked()
 }
 
 func (r *resequencer) summaryAndReset() string {
@@ -341,10 +469,12 @@ func (r *resequencer) summaryAndReset() string {
 	}
 	held := r.buffered
 	pct := 100 * float64(r.passed) / float64(r.total)
-	// histN is the number of packets that actually CAME OUT of the buffer in
-	// this interval, which is what every hold statistic is a statistic of.
-	// `held` counts the ones that went IN, and the two differ by whatever is
-	// still held at the boundary.
+	// 🚨 NORMALISE BY THE HISTOGRAM'S OWN SUM, not by `held`. A packet counts in
+	// `buffered` on the way IN and in the histogram on the way OUT, so at every
+	// interval boundary the two differ by whatever is still held. Dividing by
+	// `held` once printed "p99 512 ms" beside "max 31 ms" — the impossibility
+	// is the only reason it was caught. A statistic is normalised by the thing
+	// it is a statistic OF.
 	var histN int64
 	for _, c := range r.holdMs {
 		histN += c
@@ -353,28 +483,15 @@ func (r *resequencer) summaryAndReset() string {
 	if histN > 0 {
 		mean = time.Duration(r.holdNs / histN)
 	}
-	// ⚠️ The mean alone hid the per-gap defect: it read 3.2 ms in the download
-	// phase of the very run where the upload phase sat at 191 ms. Report the
-	// tail, and report the maximum, because that is where a broken bound shows.
-	//
-	// 🚨 NORMALISE THE PERCENTILES BY THE HISTOGRAM'S OWN SUM, not by `held`.
-	// A packet is counted in `buffered` when it goes IN and in the histogram
-	// when it comes OUT, so at every interval boundary the packets still held
-	// are in one and not the other. Dividing by `held` therefore made the
-	// cumulative walk run off the end into the overflow bucket, and a device
-	// run printed "p99 512 ms" beside "max 31ms" — the two cannot both be true,
-	// which is the only reason it was caught. THIRD wrong-denominator statistic
-	// in two days; the rule is that a percentile is normalised by the thing it
-	// is a percentile OF.
 	s := fmt.Sprintf(
-		"  reseq[%s]: %d pkts, %.1f%% already in order, %d held (hold mean %s p50/p90/p99 %d/%d/%d ms max %s over %d released, peak %d), timeouts %d, overflow %d, late-bypass %d",
+		"  reseq[%s]: %d pkts, %.1f%% already in order, %d held (hold mean %s p50/p90/p99 %d/%d/%d ms max %s over %d released, peak %d), holes %d, valve %d, overflow %d, late-bypass %d, keypairs %d/%d",
 		r.name, r.total, pct, held,
 		mean.Round(100*time.Microsecond),
 		histPct(r.holdMs[:], histN, 0.50), histPct(r.holdMs[:], histN, 0.90), histPct(r.holdMs[:], histN, 0.99),
 		r.maxHold.Round(time.Millisecond), histN, r.maxHeldObs,
-		r.timeouts, r.overflows, r.lateBypass)
+		r.timeouts, r.valves, r.overflows, r.lateBypass, r.rekeys, len(r.gens))
 	r.total, r.passed, r.buffered = 0, 0, 0
-	r.timeouts, r.overflows, r.lateBypass = 0, 0, 0
+	r.timeouts, r.valves, r.overflows, r.lateBypass, r.rekeys = 0, 0, 0, 0, 0
 	r.holdNs, r.maxHeldObs, r.maxHold = 0, 0, 0
 	for i := range r.holdMs {
 		r.holdMs[i] = 0

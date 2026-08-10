@@ -126,7 +126,7 @@ func newDownlinkHub(ctx context.Context, connect string) (*downlinkHub, error) {
 	// shuffles the uplink. A connection on its own private socket has nothing to
 	// merge with and never gets one.
 	if uplinkReseqHold > 0 {
-		h.reseq = newResequencer(c, connect)
+		h.reseq = newResequencer(c, connect, uplinkReseqHold)
 		registerResequencer(h.reseq)
 		log.Printf("downlink hub: uplink resequencer on, hold %s (measured "+
 			"lateness p90 was 6 ms, p99 7-16 ms, max 35 ms)", uplinkReseqHold)

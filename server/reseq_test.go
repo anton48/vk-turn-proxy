@@ -37,11 +37,12 @@ func (w *recorder) seen() []uint64 {
 
 func newReseq(t *testing.T, hold time.Duration) (*resequencer, *recorder) {
 	t.Helper()
-	prev := uplinkReseqHold
-	uplinkReseqHold = hold
-	t.Cleanup(func() { uplinkReseqHold = prev })
 	w := &recorder{}
-	return newResequencer(w, "test"), w
+	r := newResequencer(w, "test", hold)
+	// Stop the timer goroutine before the test ends, or it outlives the test and
+	// keeps writing counters the assertions read.
+	t.Cleanup(r.close)
+	return r, w
 }
 
 func inversions(s []uint64) int {
@@ -204,17 +205,26 @@ func TestHoldIsBoundedPerPacketNotPerGap(t *testing.T) {
 	if len(got) != gaps+1 {
 		t.Fatalf("released %d of %d packets", len(got), gaps+1)
 	}
-	// One holdFor plus generous slack for the scheduler. The per-gap bug would
-	// need gaps × hold = 400 ms and land far outside this.
-	if limit := hold + 40*time.Millisecond; elapsed > limit {
-		t.Fatalf("the last packet behind %d gaps waited %s, want under %s — "+
-			"the bound is per gap, not per packet", gaps, elapsed.Round(time.Millisecond), limit)
+	// ⚠️ The bound MOVED deliberately on 2026-08-10 and this test moved with it.
+	// Giving up a whole gap at once is what manufactured the disorder the
+	// resequencer exists to remove, so a hole is now abandoned ONE counter at a
+	// time and the per-packet ceiling is the safety valve at
+	// reseqMaxWaitFactor × holdFor. What must still hold is that it is BOUNDED
+	// and far under the old per-gap behaviour, which needed gaps × hold.
+	valve := time.Duration(reseqMaxWaitFactor) * hold
+	if limit := valve + 40*time.Millisecond; elapsed > limit {
+		t.Fatalf("the last packet behind %d gaps waited %s, want under %s",
+			gaps, elapsed.Round(time.Millisecond), limit)
+	}
+	if perGap := time.Duration(gaps) * hold; elapsed >= perGap {
+		t.Fatalf("waited %s, i.e. gaps × hold — the bound is per gap again",
+			elapsed.Round(time.Millisecond))
 	}
 	if inversions(got) != 0 {
 		t.Fatalf("released out of order: %v", got)
 	}
-	if r.maxHold > hold+40*time.Millisecond {
-		t.Fatalf("maxHold = %s, want at most ~%s", r.maxHold, hold)
+	if r.valves == 0 {
+		t.Fatal("the safety valve never opened, so this did not test it")
 	}
 }
 
@@ -261,28 +271,85 @@ func TestOverflowReleasesWithoutLoss(t *testing.T) {
 	r.close()
 }
 
-// 🚨 Rekey restarts the counter at zero under a new index. Held packets from the
-// old keypair must be flushed rather than stranded, and the new sequence must
-// not read as a four-billion-packet jump backwards.
-func TestRekeyFlushesAndRestarts(t *testing.T) {
-	r, w := newReseq(t, time.Hour)
-	_ = r.write(wgPkt(0xAAAA, 0))
-	_ = r.write(wgPkt(0xAAAA, 5)) // held behind the gap at 1
-	if len(w.seen()) != 1 {
-		t.Fatalf("released %d before the rekey, want 1", len(w.seen()))
+// 🚨 REKEY IS ORDERED, NOT FLUSHED. The sender switches keypairs at an instant,
+// so every old-keypair packet precedes every new-keypair one in the inner
+// stream. The first version kept ONE current index and reset on every switch,
+// which thrashed while 30 connections carried both keypairs — measured on the
+// device as a 4.855 s hold against a 150 ms bound and an output displacement of
+// p50 1024 / max 5572. Generations fix both the thrash and the ordering: the
+// new generation waits until the old one has been quiet for a hold.
+func TestRekeyKeepsGenerationsInOrder(t *testing.T) {
+	const hold = 40 * time.Millisecond
+	r, w := newReseq(t, hold)
+	_ = r.write(wgPkt(0xAAAA, 0)) // old keypair, in order → out at once
+	_ = r.write(wgPkt(0xAAAA, 2)) // old keypair, held behind the gap at 1
+	_ = r.write(wgPkt(0xBBBB, 0)) // NEW keypair — must not overtake the old one
+	_ = r.write(wgPkt(0xBBBB, 1))
+
+	if n := len(w.seen()); n != 1 {
+		t.Fatalf("released %d immediately, want 1 — the new keypair overtook the old", n)
 	}
-	_ = r.write(wgPkt(0xBBBB, 0)) // new keypair
+	deadline := time.Now().Add(3 * time.Second)
+	for len(w.seen()) < 4 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	got := w.seen()
+	if len(got) != 4 {
+		t.Fatalf("released %d of 4 — a generation was stranded", len(got))
+	}
+	// Counters repeat across the rekey, so order is checked by GENERATION:
+	// the old keypair's 0 and 2 must both precede the new keypair's 0 and 1.
+	if got[0] != 0 || got[1] != 2 || got[2] != 0 || got[3] != 1 {
+		t.Fatalf("emitted %v, want old(0,2) then new(0,1)", got)
+	}
+	if r.rekeys != 1 {
+		t.Fatalf("rekeys = %d, want 1", r.rekeys)
+	}
+}
+
+// 🎯 THE POINT OF THE HOLE DEADLINE, and the test had to be built twice.
+//
+// The first version expired a HELD PACKET and, to release it, declared every
+// counter between `next` and that packet lost in ONE step. With a reorder depth
+// of 200-650 that abandoned hundreds of slots whose packets were only ~15 ms
+// behind, and they then had to be forwarded out of order — `late-bypass 212`,
+// output displacement p50 185, the resequencer manufacturing the disorder it
+// exists to remove.
+//
+// ⚠️ My first attempt at this test could not tell the two apart: the straggler
+// arrived before ANY deadline expired, so both versions behaved identically and
+// the sabotage passed. The difference only shows when an expiry has already
+// happened and a packet then arrives inside the skipped range. Hence the shape
+// below: one expiry, then a straggler well above the counter we gave up on.
+func TestOneExpiryGivesUpOneCounterNotTheWholeGap(t *testing.T) {
+	const hold = 50 * time.Millisecond
+	r, w := newReseq(t, hold)
+	_ = r.write(wgPkt(1, 0))   // out at once; next = 1
+	_ = r.write(wgPkt(1, 200)) // held, far above — the deep-reorder shape
+
+	// One deadline passes: counter 1 is given up on, and ONLY counter 1.
+	time.Sleep(hold + 30*time.Millisecond)
+	if n := len(w.seen()); n != 1 {
+		t.Fatalf("released %d after one expiry, want 1 — the whole gap was abandoned", n)
+	}
+
+	// A packet from the middle of the range now arrives. It is not counter 1, so
+	// its slot must still be there.
+	_ = r.write(wgPkt(1, 5))
+	if r.lateBypass != 0 {
+		t.Fatalf("lateBypass = %d, want 0 — counter 5 was declared lost along with 1", r.lateBypass)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for len(w.seen()) < 3 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
 	got := w.seen()
 	if len(got) != 3 {
-		t.Fatalf("wrote %d packets across the rekey, want 3 — a held packet was stranded", len(got))
+		t.Fatalf("released %v, want 3 packets", got)
 	}
-	if r.lateBypass != 0 {
-		t.Fatalf("lateBypass = %d — the new sequence was compared against the old counter", r.lateBypass)
-	}
-	// The new keypair keeps working from its own zero.
-	_ = r.write(wgPkt(0xBBBB, 1))
-	if len(w.seen()) != 4 {
-		t.Fatal("the sequence did not continue after the rekey")
+	if got[0] != 0 || got[1] != 5 || got[2] != 200 {
+		t.Fatalf("emitted %v, want 0,5,200 in order", got)
 	}
 }
 
