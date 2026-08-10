@@ -71,6 +71,9 @@ const (
 	// (old + new across a rekey); a third means something is wrong and the
 	// oldest is force-closed rather than accumulating.
 	reseqMaxGens = 3
+
+	// Floor on re-arming, so no reachable state can spin the timer. See armLocked.
+	reseqMinRearm = 5 * time.Millisecond
 )
 
 // uplinkReseqHold is the hold timer from the command line. Zero disables the
@@ -91,21 +94,32 @@ var uplinkReseqHold time.Duration
 // the sender switches keypairs at an instant, so EVERY old-keypair packet
 // precedes every new-keypair one in the inner stream. Emitting strictly from
 // the oldest open generation preserves that; a bare per-index map would not.
+// heldPkt keeps the packet and its arrival time TOGETHER.
+//
+// 🚨 They used to live in two parallel maps, and a device run then showed the
+// safety valve firing ~1875 times a SECOND while nothing was held — which is
+// only possible if a timestamp outlived its packet, leaving a deadline that
+// could never be cleared and a timer that re-armed at its floor forever. I
+// could not reproduce it from the code or under a stress test shaped like the
+// device's traffic, so this removes the CLASS instead of hunting the instance:
+// with one map there is no second map to fall out of step with.
+type heldPkt struct {
+	buf []byte
+	at  time.Time
+}
+
 type generation struct {
 	idx       uint32
-	next      uint64               // the counter we are waiting for
-	held      map[uint64][]byte    // counters above next
-	heldAt    map[uint64]time.Time // arrival time, for the hold statistics
-	holeSince time.Time            // when we started waiting for `next`
-	lastSeen  time.Time            // last packet of this keypair
-	started   bool
+	next      uint64             // the counter we are waiting for
+	held      map[uint64]heldPkt // counters above next, with their arrival time
+	holeSince time.Time          // when we started waiting for `next`
+	lastSeen  time.Time          // last packet of this keypair
 }
 
 func newGeneration(idx uint32, ctr uint64, now time.Time) *generation {
 	return &generation{
-		idx: idx, next: ctr, started: true,
-		held:      map[uint64][]byte{},
-		heldAt:    map[uint64]time.Time{},
+		idx: idx, next: ctr,
+		held:      map[uint64]heldPkt{},
 		holeSince: now,
 		lastSeen:  now,
 	}
@@ -227,10 +241,10 @@ func (r *resequencer) holdLocked(g *generation, ctr uint64, pkt []byte, now time
 	r.buffered++
 	cp := make([]byte, len(pkt))
 	copy(cp, pkt)
-	if _, dup := g.held[ctr]; !dup {
-		g.heldAt[ctr] = now
+	if old, dup := g.held[ctr]; dup {
+		now = old.at // a duplicate keeps the original's clock
 	}
-	g.held[ctr] = cp
+	g.held[ctr] = heldPkt{buf: cp, at: now}
 	if n := r.heldCountLocked(); n > r.maxHeldObs {
 		r.maxHeldObs = n
 	}
@@ -247,16 +261,13 @@ func (r *resequencer) heldCountLocked() int {
 // drainLocked releases every packet of g that has become contiguous.
 func (r *resequencer) drainLocked(g *generation) {
 	for {
-		buf, ok := g.held[g.next]
+		h, ok := g.held[g.next]
 		if !ok {
 			break
 		}
-		if t, ok := g.heldAt[g.next]; ok {
-			r.recordHold(time.Since(t))
-			delete(g.heldAt, g.next)
-		}
+		r.recordHold(time.Since(h.at))
 		delete(g.held, g.next)
-		_ = r.writeLocked(buf)
+		_ = r.writeLocked(h.buf)
 		g.next++
 	}
 }
@@ -338,8 +349,8 @@ func (r *resequencer) oldestDeadlineLocked() (time.Time, bool) {
 		if i == 0 {
 			// The hole clock, plus the per-packet safety valve.
 			consider(g.holeSince.Add(r.hold))
-			for _, t := range g.heldAt {
-				consider(t.Add(reseqMaxWaitFactor * r.hold))
+			for _, h := range g.held {
+				consider(h.at.Add(reseqMaxWaitFactor * r.hold))
 			}
 			continue
 		}
@@ -360,8 +371,13 @@ func (r *resequencer) armLocked(now time.Time) {
 		return
 	}
 	d := deadline.Sub(now)
-	if d < time.Millisecond {
-		d = time.Millisecond
+	// ⚠️ FLOOR, not a rounding convenience. A deadline stuck in the past used to
+	// re-arm at 1 ms forever — measured on the device as ~1875 timer firings per
+	// second, every one of them taking the mutex that all 30 writers need. The
+	// floor bounds what any such bug can cost, and the `valve` counter in
+	// conn-stats makes it visible instead of merely slow.
+	if d < reseqMinRearm {
+		d = reseqMinRearm
 	}
 	if r.timer != nil {
 		r.timer.Stop()
@@ -395,8 +411,8 @@ func (r *resequencer) onTimeout() {
 	g := r.gens[0]
 	// Safety valve first: any packet that has waited far too long ends the gap
 	// wholesale, so the per-packet bound survives a genuinely missing run.
-	for _, t := range g.heldAt {
-		if now.Sub(t) >= reseqMaxWaitFactor*r.hold {
+	for _, h := range g.held {
+		if now.Sub(h.at) >= reseqMaxWaitFactor*r.hold {
 			r.valves++
 			r.abandonGapLocked(g, now)
 			break
@@ -418,10 +434,9 @@ func (r *resequencer) closeOldestLocked() {
 	}
 	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
 	for _, c := range keys {
-		if t, ok := g.heldAt[c]; ok {
-			r.recordHold(time.Since(t))
-		}
-		_ = r.writeLocked(g.held[c])
+		h := g.held[c]
+		r.recordHold(time.Since(h.at))
+		_ = r.writeLocked(h.buf)
 	}
 	r.gens = r.gens[1:]
 	// 🚨 The promoted generation must be DRAINED at once. While it was queued
