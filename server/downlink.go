@@ -131,8 +131,10 @@ func newDownlinkHub(ctx context.Context, connect, label string) (*downlinkHub, e
 	if uplinkReseqHold > 0 {
 		h.reseq = newResequencer(c, label, uplinkReseqHold)
 		registerResequencer(h.reseq)
-		log.Printf("downlink hub %s: uplink resequencer on, hold %s (measured "+
-			"lateness p90 was 6 ms, p99 7-16 ms, max 35 ms)", label, uplinkReseqHold)
+		log.Printf("downlink hub %s: uplink resequencer on, hold %s — measured "+
+			"optimum is 150ms, where residual output disorder first reads 0.00%%; "+
+			"below it the resequencer manufactures disorder (30ms leaves 11.3%%)",
+			label, uplinkReseqHold)
 	}
 	context.AfterFunc(ctx, func() {
 		if h.reseq != nil {

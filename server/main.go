@@ -109,11 +109,14 @@ func main() {
 			"The client stripes one inner flow across N connections of unequal "+
 			"latency, so 73-86% of packets arrive displaced (median depth ~N/2) "+
 			"with ZERO loss — and the inner TCP reads that as loss, answers 69% "+
-			"of its ACKs as duplicates and never leaves fast-recovery. The "+
-			"shuffle is deep in packets but short in time (measured lateness p90 "+
-			"6 ms, p99 7-16 ms, max 35 ms), so 30ms-40ms should catch nearly all "+
-			"of it. Nothing is ever dropped: a packet whose slot has already been "+
-			"released is forwarded late rather than discarded.")
+			"of its ACKs as duplicates and never leaves fast-recovery. SIZE IT "+
+			"FROM THE DISPLACEMENT DEPTH, NOT FROM THE 'late' FIGURE: depth p90 "+
+			"is 280-340 packets, which at ~1300 pkt/s is 230-265 ms of stream, "+
+			"and 150ms is the measured point where residual output disorder "+
+			"first reaches 0.00%. A SHORTER hold is actively harmful — 30ms "+
+			"leaves 11.3% of the output still displaced and manufactures bursts "+
+			"of late releases. Nothing is ever dropped: a packet whose slot has "+
+			"already been released is forwarded late rather than discarded.")
 	logFile := flag.String("logfile", "",
 		"if set, append log output to this file instead of stdout. The "+
 			"file is opened in append mode (O_APPEND|O_CREATE) so logs from "+

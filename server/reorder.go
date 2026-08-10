@@ -77,8 +77,17 @@ const (
 
 // peerSeq tracks one keypair's counter sequence.
 type peerSeq struct {
-	max   uint64    // highest counter seen
-	maxAt time.Time // when it was seen — lateness is measured against this
+	max uint64 // highest counter seen
+	// maxAt is when `max` was seen, and `late` is measured against it.
+	//
+	// 🚨 SO `late` IS NOT "HOW LONG A MISSING PACKET TAKES TO ARRIVE." It is the
+	// time since the NEWEST counter arrived, which under a continuous stream is
+	// an inter-arrival gap — p50 4 ms, p90 39 ms. Sizing the resequencer's hold
+	// from it gave "25-40 ms should catch nearly everything"; measured, 30 ms is
+	// the worst working setting there is (11.3% of the output still displaced).
+	// The quantity that sizes a hold is DEPTH: p90 of 280-340 packets at
+	// ~1300 pkt/s is 230-265 ms of stream. Report `late` as what it is.
+	maxAt time.Time
 	seen  []uint64  // bitmap ring over (max-reorderDupWindow, max]
 	last  time.Time // for idle pruning
 }
