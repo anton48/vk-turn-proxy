@@ -254,23 +254,105 @@ func TestLatePacketIsForwardedNotDropped(t *testing.T) {
 func TestOverflowReleasesWithoutLoss(t *testing.T) {
 	r, w := newReseq(t, time.Hour) // the timer must not be what saves us
 	_ = r.write(wgPkt(1, 0))
-	// 1 never arrives; pile up more than the buffer allows.
-	for i := uint64(2); i < uint64(reseqMaxHeld+50); i++ {
+	// 1 never arrives; pile up more than the buffer allows. The loop runs in
+	// microseconds, so the rate estimate never completes a window and the bound
+	// sits at its floor — which is the case worth testing, since the floor is
+	// what a low-rate tunnel actually gets.
+	const n = reseqMaxHeldFloor + 50
+	for i := uint64(2); i < uint64(n); i++ {
 		_ = r.write(wgPkt(1, i))
 	}
 	if r.overflows == 0 {
 		t.Fatal("overflows = 0 — the buffer bound never engaged")
 	}
 	got := w.seen()
-	// 1 (counter 0) + (reseqMaxHeld+50-2) more = reseqMaxHeld+49 in, and NOTHING
-	// may be dropped, so exactly that many must come out.
-	if want := reseqMaxHeld + 49; len(got) != want {
+	// 1 (counter 0) + (n-2) more = n-1 in, and NOTHING may be dropped, so
+	// exactly that many must come out.
+	if want := n - 1; len(got) != want {
 		t.Fatalf("wrote %d packets, want %d — overflow dropped data", len(got), want)
 	}
 	if inversions(got) != 0 {
 		t.Fatal("overflow released out of order")
 	}
 	r.close()
+}
+
+// ⚠️ THE WIRING, tested separately from the arithmetic — and it had to be.
+//
+// The scaling test below drives the estimator directly, so it stays GREEN when
+// the call to noteRateLocked is deleted from write(): the bound would then sit
+// at its floor forever and nothing would notice. This one goes through the real
+// write path, which is the only thing that proves the feature is alive.
+func TestTheBufferBoundIsFedByTheWritePath(t *testing.T) {
+	r, _ := newReseq(t, 150*time.Millisecond)
+	// In-order packets, so nothing is buffered and only the rate estimate moves.
+	// The first write starts the window; the burst accumulates inside it; the
+	// write after the window has elapsed is what closes it.
+	_ = r.write(wgPkt(1, 0))
+	for i := uint64(1); i < 500; i++ {
+		_ = r.write(wgPkt(1, i))
+	}
+	time.Sleep(reseqRateWindow + 10*time.Millisecond)
+	_ = r.write(wgPkt(1, 500))
+
+	r.mu.Lock()
+	rate, bound := r.rateEWMA, r.maxHeldLocked()
+	r.mu.Unlock()
+	if rate <= 0 {
+		t.Fatal("rate is 0 after 501 packets — write() does not feed the estimator")
+	}
+	if bound <= reseqMaxHeldFloor {
+		t.Fatalf("bound %d at %.0f pkt/s — still at the floor, so the rate never "+
+			"reached the bound through the real path", bound, rate)
+	}
+}
+
+// 🚨 THE BOUND IS A TIME, NOT A PACKET COUNT.
+//
+// It must cover the longest wait the resequencer itself permits — the safety
+// valve at reseqMaxWaitFactor × hold — and how many PACKETS that is depends on
+// the arrival rate, which varies ~30× between an idle tunnel and a saturated
+// one. A fixed 2048 was sized at ~1300 pkt/s and the device hit it at ~3400
+// (peak 2049, overflow 12, hold max 1.423 s, 3.6% of the output displaced).
+func TestBufferBoundScalesWithTheArrivalRate(t *testing.T) {
+	const hold = 150 * time.Millisecond
+	r, _ := newReseq(t, hold)
+
+	r.mu.Lock()
+	atFloor := r.maxHeldLocked()
+	r.mu.Unlock()
+	if atFloor != reseqMaxHeldFloor {
+		t.Fatalf("with no rate estimate the bound is %d, want the floor %d", atFloor, reseqMaxHeldFloor)
+	}
+
+	// Feed a rate the fixed 2048 could not cover: 3400 pkt/s, which is what a
+	// multi-stream upload produced. Drive the estimator directly rather than
+	// sleeping — the window is 250 ms and a test should not spend it.
+	r.mu.Lock()
+	start := time.Now()
+	r.rateStart = start.Add(-reseqRateWindow)
+	r.rateCount = int(3400 * reseqRateWindow.Seconds())
+	r.noteRateLocked(start)
+	rate, got := r.rateEWMA, r.maxHeldLocked()
+	r.mu.Unlock()
+
+	if rate < 3000 || rate > 3800 {
+		t.Fatalf("rate estimate %.0f pkt/s, want ~3400 — the estimator is off", rate)
+	}
+	// The valve permits 3 × 150 ms = 450 ms of waiting, which at 3400 pkt/s is
+	// ~1530 packets; with the 2× margin the bound must be ~3060.
+	want := int(3400 * (reseqMaxWaitFactor * hold).Seconds() * reseqHeldMargin)
+	if got < want*9/10 || got > want*11/10 {
+		t.Fatalf("bound %d at %.0f pkt/s, want ~%d (%d ms of valve × %d margin)",
+			got, rate, want, (reseqMaxWaitFactor * hold).Milliseconds(), reseqHeldMargin)
+	}
+	if got <= 2048 {
+		t.Fatalf("bound %d — no better than the fixed 2048 this replaced, at the "+
+			"very rate that overflowed it", got)
+	}
+	if got > reseqMaxHeldCeil {
+		t.Fatalf("bound %d exceeds the memory ceiling %d", got, reseqMaxHeldCeil)
+	}
 }
 
 // 🚨 REKEY IS ORDERED, NOT FLUSHED. The sender switches keypairs at an instant,

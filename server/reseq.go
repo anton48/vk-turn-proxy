@@ -53,9 +53,36 @@ import (
 // nothing to merge with and is left alone.
 
 const (
-	// maxHeld bounds memory and the damage a stuck sequence can do, across all
-	// live generations together.
-	reseqMaxHeld = 2048
+	// 🚨 THE BUFFER BOUND IS A TIME, NOT A PACKET COUNT — and it was a packet
+	// count until 2026-08-10, which is how a real workload walked into it.
+	//
+	// What the buffer must cover is the longest wait the resequencer itself
+	// permits: the safety valve at reseqMaxWaitFactor × hold. How many PACKETS
+	// that is depends entirely on the arrival rate, and the rate varies by 30×
+	// between an idle tunnel and a saturated one. A fixed 2048 was sized on a
+	// single-stream run at ~1300 pkt/s, where it is 1.6 s of stream and looks
+	// enormous. On a multi-stream upload at 4.2 MiB/s ≈ 3400 pkt/s the valve
+	// alone permits 450 ms ≈ 1530 packets of legitimate waiting, leaving almost
+	// no margin — and the device duly hit peak 2049 with `overflow 12`, a hold
+	// max of 1.423 s and 3.6% of the output displaced in that tick.
+	//
+	// So the cap is now computed per resequencer from a measured arrival rate,
+	// with the floor and ceiling below as the only fixed numbers. The ceiling is
+	// what actually bounds memory: 8192 × ~1.5 KB ≈ 12 MB per group, worst case,
+	// and only while a sequence is genuinely stuck.
+	reseqMaxHeldFloor = 512
+	reseqMaxHeldCeil  = 8192
+
+	// How much slack over the valve's own bound. 2× so that ordinary jitter in
+	// the rate estimate cannot push a healthy stream into the overflow path,
+	// which abandons a gap wholesale and is far more expensive than the memory.
+	reseqHeldMargin = 2
+
+	// The arrival-rate estimate is coarse on purpose: a short window so it
+	// tracks the start of a burst, and a light EWMA so one quiet window does not
+	// shrink the buffer under a stream that is about to resume.
+	reseqRateWindow = 250 * time.Millisecond
+	reseqRateAlpha  = 0.3
 
 	// Hold time is reported as a distribution, not just a mean. The defect that
 	// made that necessary hid behind a 3.2 ms mean in one phase while another
@@ -197,6 +224,49 @@ type resequencer struct {
 	logSecond  int64 // the unix second logSpent belongs to
 	logSpent   int
 	logDropped int64 // suppressed lines, reported and reset by the dump
+
+	// Coarse arrival rate, pkt/s, for sizing the buffer — see reseqMaxHeldFloor.
+	rateStart time.Time
+	rateCount int
+	rateEWMA  float64
+}
+
+// noteRateLocked keeps the arrival-rate estimate the buffer bound is sized from.
+// Caller holds r.mu.
+func (r *resequencer) noteRateLocked(now time.Time) {
+	if r.rateStart.IsZero() {
+		r.rateStart = now
+	}
+	r.rateCount++
+	elapsed := now.Sub(r.rateStart)
+	if elapsed < reseqRateWindow {
+		return
+	}
+	inst := float64(r.rateCount) / elapsed.Seconds()
+	if r.rateEWMA == 0 {
+		r.rateEWMA = inst
+	} else {
+		r.rateEWMA += reseqRateAlpha * (inst - r.rateEWMA)
+	}
+	r.rateCount, r.rateStart = 0, now
+}
+
+// maxHeldLocked is the buffer bound in packets, derived from the time the safety
+// valve permits a packet to wait. Caller holds r.mu.
+//
+// ⚠️ Read the floor as "we always allow at least this much" rather than as a
+// tuning knob: at a low rate the computed value is a handful of packets, and a
+// buffer that small would send an ordinary reorder burst straight into the
+// overflow path.
+func (r *resequencer) maxHeldLocked() int {
+	n := int(r.rateEWMA * (reseqMaxWaitFactor * r.hold).Seconds() * reseqHeldMargin)
+	if n < reseqMaxHeldFloor {
+		return reseqMaxHeldFloor
+	}
+	if n > reseqMaxHeldCeil {
+		return reseqMaxHeldCeil
+	}
+	return n
 }
 
 // logfLocked emits one lifecycle line, under a per-second budget. Caller holds
@@ -239,6 +309,7 @@ func (r *resequencer) write(pkt []byte) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.total++
+	r.noteRateLocked(now)
 
 	g := r.genLocked(idx, ctr, now)
 	g.lastSeen = now
@@ -271,7 +342,7 @@ func (r *resequencer) write(pkt []byte) error {
 	}
 
 	r.holdLocked(g, ctr, pkt, now)
-	if r.heldCountLocked() > reseqMaxHeld {
+	if r.heldCountLocked() > r.maxHeldLocked() {
 		r.overflows++
 		r.abandonGapLocked(g, now)
 	}
@@ -628,11 +699,11 @@ func (r *resequencer) summaryAndReset() string {
 		mean = time.Duration(r.holdNs / histN)
 	}
 	s := fmt.Sprintf(
-		"  reseq[%s]: %d pkts, %.1f%% already in order, %d held (hold mean %s p50/p90/p99 %d/%d/%d ms max %s over %d released, peak %d), holes %d, valve %d, overflow %d, late-bypass %d, keypairs %d/%d, log-drop %d",
+		"  reseq[%s]: %d pkts, %.1f%% already in order, %d held (hold mean %s p50/p90/p99 %d/%d/%d ms max %s over %d released, peak %d of %d at %.0f pkt/s), holes %d, valve %d, overflow %d, late-bypass %d, keypairs %d/%d, log-drop %d",
 		r.name, r.total, pct, held,
 		mean.Round(100*time.Microsecond),
 		histPct(r.holdMs[:], histN, 0.50), histPct(r.holdMs[:], histN, 0.90), histPct(r.holdMs[:], histN, 0.99),
-		r.maxHold.Round(time.Millisecond), histN, r.maxHeldObs,
+		r.maxHold.Round(time.Millisecond), histN, r.maxHeldObs, r.maxHeldLocked(), r.rateEWMA,
 		r.timeouts, r.valves, r.overflows, r.lateBypass, r.rekeys, len(r.gens), r.logDropped)
 	r.total, r.passed, r.buffered = 0, 0, 0
 	r.timeouts, r.valves, r.overflows, r.lateBypass, r.rekeys = 0, 0, 0, 0, 0
