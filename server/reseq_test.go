@@ -353,6 +353,60 @@ func TestOneExpiryGivesUpOneCounterNotTheWholeGap(t *testing.T) {
 	}
 }
 
+// 🚨 THE 56-SECOND STALL. A generation queued behind an older one buffers
+// everything it receives, so counters BELOW the first one it happened to see
+// arrive afterwards. If it fixes its start from that first packet, those land
+// permanently below the watermark: drainLocked cannot reach below `next`, and
+// abandonGapLocked used to move the watermark only when the lowest held counter
+// was ABOVE it — so the safety valve found them expired forever.
+//
+// On the device that was ~1400 packets stuck, the valve firing ~3700 times a
+// second, and a single iperf run flat at zero from its fourth second to its
+// last. A queued generation must therefore pick its start at PROMOTION, from
+// the lowest counter it actually holds.
+func TestQueuedGenerationDoesNotStrandLowCounters(t *testing.T) {
+	const hold = 40 * time.Millisecond
+	r, w := newReseq(t, hold)
+
+	_ = r.write(wgPkt(0xAAAA, 0)) // old keypair, emitted at once
+	// New keypair, and the connections deliver it out of order: a HIGH counter
+	// first, then lower ones. This is the ordinary shape of the fan-out.
+	_ = r.write(wgPkt(0xBBBB, 40))
+	_ = r.write(wgPkt(0xBBBB, 5))
+	_ = r.write(wgPkt(0xBBBB, 6))
+	_ = r.write(wgPkt(0xBBBB, 7))
+
+	deadline := time.Now().Add(3 * time.Second)
+	for len(w.seen()) < 5 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	got := w.seen()
+	if len(got) != 5 {
+		t.Fatalf("released %v — %d of 5; low counters were stranded below the watermark", got, len(got))
+	}
+	if got[0] != 0 || got[1] != 5 || got[2] != 6 || got[3] != 7 || got[4] != 40 {
+		t.Fatalf("emitted %v, want old(0) then new(5,6,7,40)", got)
+	}
+
+	// And nothing may be left unreachable, which is what made the valve spin.
+	r.mu.Lock()
+	stuck, valves := 0, r.valves
+	for _, g := range r.gens {
+		for c := range g.held {
+			if c < g.next {
+				stuck++
+			}
+		}
+	}
+	r.mu.Unlock()
+	if stuck != 0 {
+		t.Fatalf("%d packets left below the watermark — unreachable forever", stuck)
+	}
+	if valves > 10 {
+		t.Fatalf("valve fired %d times — spinning on an unreachable entry", valves)
+	}
+}
+
 // Handshakes carry no counter and must never be delayed — holding one could
 // break the session, and there are far too few to matter.
 func TestHandshakesAreNeverHeld(t *testing.T) {

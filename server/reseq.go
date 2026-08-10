@@ -114,15 +114,33 @@ type generation struct {
 	held      map[uint64]heldPkt // counters above next, with their arrival time
 	holeSince time.Time          // when we started waiting for `next`
 	lastSeen  time.Time          // last packet of this keypair
+	started   bool               // false while queued behind an older generation
 }
 
-func newGeneration(idx uint32, ctr uint64, now time.Time) *generation {
-	return &generation{
-		idx: idx, next: ctr,
+// newGeneration starts a keypair's sequence.
+//
+// 🚨 `started` says whether `next` means anything yet. A generation created
+// while an OLDER one is still emitting must NOT fix its start from the first
+// packet it happens to see: it is buffering, so packets with lower counters
+// arrive afterwards and would land permanently below the watermark. It picks
+// its start at PROMOTION, from the lowest counter it actually holds.
+//
+// Getting this wrong cost a 56-second stall on the device: ~1400 packets stuck
+// below `next`, unreachable by drainLocked, with the safety valve finding them
+// expired ~3700 times a second and abandonGapLocked unable to move — it only
+// advances the watermark when the lowest held counter is ABOVE it.
+func newGeneration(idx uint32, now time.Time, started bool, ctr uint64) *generation {
+	g := &generation{
+		idx:       idx,
 		held:      map[uint64]heldPkt{},
 		holeSince: now,
 		lastSeen:  now,
+		started:   started,
 	}
+	if started {
+		g.next = ctr
+	}
+	return g
 }
 
 // resequencer restores counter order for one group of connections.
@@ -227,7 +245,9 @@ func (r *resequencer) genLocked(idx uint32, ctr uint64, now time.Time) *generati
 	if len(r.gens) > 0 {
 		r.rekeys++
 	}
-	g := newGeneration(idx, ctr, now)
+	// Only the first generation knows where it starts; a queued one decides at
+	// promotion, from the lowest counter it holds.
+	g := newGeneration(idx, now, len(r.gens) == 0, ctr)
 	r.gens = append(r.gens, g)
 	// More than two live keypairs is not a thing WireGuard does; force-close the
 	// oldest rather than let the list grow.
@@ -325,9 +345,11 @@ func (r *resequencer) abandonGapLocked(g *generation, now time.Time) {
 	if first {
 		return
 	}
-	if lowest > g.next {
-		g.next = lowest
-	}
+	// ⚠️ Move the watermark even when the lowest held counter is BELOW it.
+	// Leaving it put is what made an unreachable entry immortal: nothing can
+	// drain below `next`, so the valve found it expired forever. If this branch
+	// ever fires, something upstream is wrong — but the buffer still drains.
+	g.next = lowest
 	g.holeSince = now
 	r.drainLocked(g)
 }
@@ -439,12 +461,26 @@ func (r *resequencer) closeOldestLocked() {
 		_ = r.writeLocked(h.buf)
 	}
 	r.gens = r.gens[1:]
-	// 🚨 The promoted generation must be DRAINED at once. While it was queued
-	// behind an older one every packet was held, including the one equal to its
-	// own `next` — so without this its first packet sits below the watermark
-	// forever and is stranded. Caught by the rekey-ordering test.
+	// 🚨 The promoted generation now picks its start and is drained at once.
+	// While queued it held everything, so its start is the LOWEST counter it
+	// holds — taking the first one seen instead would strand every lower
+	// counter below the watermark, permanently.
 	if len(r.gens) > 0 {
-		r.drainLocked(r.gens[0])
+		n := r.gens[0]
+		if !n.started {
+			lowest, first := uint64(0), true
+			for c := range n.held {
+				if first || c < lowest {
+					lowest, first = c, false
+				}
+			}
+			if !first {
+				n.next = lowest
+			}
+			n.started = true
+			n.holeSince = time.Now()
+		}
+		r.drainLocked(n)
 	}
 }
 
