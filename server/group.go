@@ -87,6 +87,16 @@ type groupKey [groupIDLen]byte
 
 func (k groupKey) String() string { return hex.EncodeToString(k[:]) }
 
+// label identifies this group in log lines. Spelling the legacy key out beats
+// printing 32 zeros, and everything else matches the `group %s:` lines exactly
+// so the two can be joined by grep.
+func (k groupKey) label() string {
+	if k == legacyGroupKey {
+		return "legacy"
+	}
+	return k.String()
+}
+
 // legacyGroupKey is the group that ungrouped connections join when
 // -single-client is set. It cannot collide with a real session UUID because the
 // client draws that from crypto/rand; an all-zero draw is not worth guarding.
@@ -119,7 +129,7 @@ func (r *hubRegistry) acquire(ctx context.Context, connect string, key groupKey)
 		return e.hub, nil
 	}
 	hubCtx, cancel := context.WithCancel(ctx)
-	h, err := newDownlinkHub(hubCtx, connect)
+	h, err := newDownlinkHub(hubCtx, connect, key.label())
 	if err != nil {
 		cancel()
 		return nil, err

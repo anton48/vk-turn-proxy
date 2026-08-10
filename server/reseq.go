@@ -74,6 +74,27 @@ const (
 
 	// Floor on re-arming, so no reachable state can spin the timer. See armLocked.
 	reseqMinRearm = 5 * time.Millisecond
+
+	// 🚨 CEILING ON THE LIFECYCLE LOG, and it is not decoration.
+	//
+	// The three lifecycle lines are worth about four per REKEY — one burst every
+	// ~120 s, which is why they are printed at all. But the rate is not set by
+	// the rekey period: genLocked's force-close loop fires once per PACKET whose
+	// receiver index is not one of the three tracked, and each iteration emits
+	// four lines. Measured at 4.00 lines per packet on a stream of rotating
+	// indices, and 110 lines/s from as little as two indices alternating with a
+	// quiet gap — no cap breach needed.
+	//
+	// `idx` is read straight out of pkt[4:8] with no WireGuard validation, so a
+	// remote peer sets that rate. Worse, every one of these runs with r.mu held —
+	// the one mutex all N uplink writers contend on — and -logfile makes each
+	// line a synchronous write(2) inside the critical section. That is the exact
+	// shape of the ~3700/s valve spin the comments in this file exist to prevent,
+	// with remote input in place of a timer.
+	//
+	// Suppressed lines are COUNTED and printed by the dump, so a storm becomes a
+	// number instead of silence.
+	reseqLogPerSec = 8
 )
 
 // uplinkReseqHold is the hold timer from the command line. Zero disables the
@@ -113,7 +134,9 @@ type generation struct {
 	next      uint64             // the counter we are waiting for
 	held      map[uint64]heldPkt // counters above next, with their arrival time
 	holeSince time.Time          // when we started waiting for `next`
+	firstSeen time.Time          // first packet of this keypair — the rekey instant
 	lastSeen  time.Time          // last packet of this keypair
+	seen      int64              // transport packets of this keypair
 	started   bool               // false while queued behind an older generation
 }
 
@@ -134,6 +157,7 @@ func newGeneration(idx uint32, now time.Time, started bool, ctr uint64) *generat
 		idx:       idx,
 		held:      map[uint64]heldPkt{},
 		holeSince: now,
+		firstSeen: now,
 		lastSeen:  now,
 		started:   started,
 	}
@@ -168,6 +192,25 @@ type resequencer struct {
 	holdMs     [reseqHoldBuckets + 1]int64
 	maxHold    time.Duration
 	maxHeldObs int
+
+	// Budget for the lifecycle log — see reseqLogPerSec.
+	logSecond  int64 // the unix second logSpent belongs to
+	logSpent   int
+	logDropped int64 // suppressed lines, reported and reset by the dump
+}
+
+// logfLocked emits one lifecycle line, under a per-second budget. Caller holds
+// r.mu — which is precisely why the budget exists; see reseqLogPerSec.
+func (r *resequencer) logfLocked(format string, args ...any) {
+	if sec := time.Now().Unix(); sec != r.logSecond {
+		r.logSecond, r.logSpent = sec, 0
+	}
+	if r.logSpent >= reseqLogPerSec {
+		r.logDropped++
+		return
+	}
+	r.logSpent++
+	log.Printf(format, args...)
 }
 
 // newResequencer captures the hold ONCE, at construction.
@@ -199,6 +242,7 @@ func (r *resequencer) write(pkt []byte) error {
 
 	g := r.genLocked(idx, ctr, now)
 	g.lastSeen = now
+	g.seen++
 
 	// Only the oldest generation may emit. A newer one buffers until the older
 	// closes, which is what keeps the two sides of a rekey in order.
@@ -249,9 +293,40 @@ func (r *resequencer) genLocked(idx uint32, ctr uint64, now time.Time) *generati
 	// promotion, from the lowest counter it holds.
 	g := newGeneration(idx, now, len(r.gens) == 0, ctr)
 	r.gens = append(r.gens, g)
+	// 🎯 THE REKEY IS LOGGED, not merely counted. `keypairs R/G` in conn-stats
+	// says a rotation happened SOMEWHERE inside a 2 s window, which is not enough
+	// to line it up against a one-second stall in the client's own trace — that
+	// question came up on 2026-08-10 and the counter could not answer it. These
+	// three lines carry the instants and the cost: how long the newer keypair
+	// waited to be promoted, how much it buffered meanwhile, and how much the
+	// older one still had in hand when it closed. One rotation is ~120 s apart,
+	// so the volume is a handful of lines per session.
+	if len(r.gens) > 1 {
+		head := r.gens[0]
+		// ⚠️ `quiet` is measured at LOG time, not from `now`. `now` was taken in
+		// write() BEFORE the lock, so another writer can have advanced
+		// head.lastSeen past it while this one waited — which printed a negative
+		// duration. Anything derived from a pre-lock clock against state that
+		// moves under the lock has this bug.
+		//
+		// ⚠️ And it says "generation(s) ahead", not "the head", because with three
+		// live keypairs this one waits for ALL the older ones to close, not just
+		// for gens[0].
+		r.logfLocked("reseq[%s]: keypair 0x%08x OPENED at ctr %d — QUEUED behind %d "+
+			"generation(s), oldest 0x%08x (next %d, %d held, %d pkts, quiet %s). It "+
+			"buffers everything and picks its start when it reaches the front; each "+
+			"generation ahead closes after %s of quiet.",
+			r.name, idx, ctr, len(r.gens)-1, head.idx, head.next, len(head.held), head.seen,
+			time.Since(head.lastSeen).Round(time.Millisecond), r.hold)
+	} else {
+		r.logfLocked("reseq[%s]: keypair 0x%08x opened at ctr %d — first of this group, "+
+			"emitting immediately", r.name, idx, ctr)
+	}
 	// More than two live keypairs is not a thing WireGuard does; force-close the
 	// oldest rather than let the list grow.
 	for len(r.gens) > reseqMaxGens {
+		r.logfLocked("reseq[%s]: %d live keypairs, more than WireGuard uses — force-closing "+
+			"the oldest (0x%08x). Something upstream is wrong.", r.name, len(r.gens), r.gens[0].idx)
 		r.closeOldestLocked()
 	}
 	return g
@@ -461,12 +536,17 @@ func (r *resequencer) closeOldestLocked() {
 		_ = r.writeLocked(h.buf)
 	}
 	r.gens = r.gens[1:]
+	r.logfLocked("reseq[%s]: keypair 0x%08x CLOSED after %s, %d pkts, next %d, quiet %s — "+
+		"%d flushed in counter order at close",
+		r.name, g.idx, time.Since(g.firstSeen).Round(time.Millisecond), g.seen, g.next,
+		time.Since(g.lastSeen).Round(time.Millisecond), len(keys))
 	// 🚨 The promoted generation now picks its start and is drained at once.
 	// While queued it held everything, so its start is the LOWEST counter it
 	// holds — taking the first one seen instead would strand every lower
 	// counter below the watermark, permanently.
 	if len(r.gens) > 0 {
 		n := r.gens[0]
+		promoted, heldBefore := !n.started, len(n.held)
 		if !n.started {
 			lowest, first := uint64(0), true
 			for c := range n.held {
@@ -480,7 +560,20 @@ func (r *resequencer) closeOldestLocked() {
 			n.started = true
 			n.holeSince = time.Now()
 		}
+		// ⚠️ Capture the START before draining. `next` walks forward as the drain
+		// runs, so logging it afterwards reports the watermark the drain stopped
+		// at — which is NOT the counter the generation started from, and is
+		// exactly the thing this line exists to show. The test caught it.
+		start := n.next
 		r.drainLocked(n)
+		if promoted {
+			// The one number the 2 s counter could never give: how long this
+			// keypair's packets sat waiting for the previous one to finish.
+			r.logfLocked("reseq[%s]: keypair 0x%08x PROMOTED after %s queued, start ctr %d, "+
+				"%d pkts seen — %d of %d held drained at once to ctr %d, %d still held",
+				r.name, n.idx, time.Since(n.firstSeen).Round(time.Millisecond), start,
+				n.seen, heldBefore-len(n.held), heldBefore, n.next, len(n.held))
+		}
 	}
 }
 
@@ -535,14 +628,15 @@ func (r *resequencer) summaryAndReset() string {
 		mean = time.Duration(r.holdNs / histN)
 	}
 	s := fmt.Sprintf(
-		"  reseq[%s]: %d pkts, %.1f%% already in order, %d held (hold mean %s p50/p90/p99 %d/%d/%d ms max %s over %d released, peak %d), holes %d, valve %d, overflow %d, late-bypass %d, keypairs %d/%d",
+		"  reseq[%s]: %d pkts, %.1f%% already in order, %d held (hold mean %s p50/p90/p99 %d/%d/%d ms max %s over %d released, peak %d), holes %d, valve %d, overflow %d, late-bypass %d, keypairs %d/%d, log-drop %d",
 		r.name, r.total, pct, held,
 		mean.Round(100*time.Microsecond),
 		histPct(r.holdMs[:], histN, 0.50), histPct(r.holdMs[:], histN, 0.90), histPct(r.holdMs[:], histN, 0.99),
 		r.maxHold.Round(time.Millisecond), histN, r.maxHeldObs,
-		r.timeouts, r.valves, r.overflows, r.lateBypass, r.rekeys, len(r.gens))
+		r.timeouts, r.valves, r.overflows, r.lateBypass, r.rekeys, len(r.gens), r.logDropped)
 	r.total, r.passed, r.buffered = 0, 0, 0
 	r.timeouts, r.valves, r.overflows, r.lateBypass, r.rekeys = 0, 0, 0, 0, 0
+	r.logDropped = 0
 	r.holdNs, r.maxHeldObs, r.maxHold = 0, 0, 0
 	for i := range r.holdMs {
 		r.holdMs[i] = 0

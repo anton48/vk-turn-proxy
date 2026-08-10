@@ -83,7 +83,10 @@ type downlinkHub struct {
 	reseq *resequencer // nil unless -uplink-reseq is set
 }
 
-func newDownlinkHub(ctx context.Context, connect string) (*downlinkHub, error) {
+// label identifies the GROUP in this hub's log lines. Every group dials the same
+// -connect address, so naming the resequencer after that address made two
+// clients' rekeys indistinguishable — which defeats the point of logging them.
+func newDownlinkHub(ctx context.Context, connect, label string) (*downlinkHub, error) {
 	c, err := net.Dial("udp", connect)
 	if err != nil {
 		return nil, err
@@ -126,10 +129,10 @@ func newDownlinkHub(ctx context.Context, connect string) (*downlinkHub, error) {
 	// shuffles the uplink. A connection on its own private socket has nothing to
 	// merge with and never gets one.
 	if uplinkReseqHold > 0 {
-		h.reseq = newResequencer(c, connect, uplinkReseqHold)
+		h.reseq = newResequencer(c, label, uplinkReseqHold)
 		registerResequencer(h.reseq)
-		log.Printf("downlink hub: uplink resequencer on, hold %s (measured "+
-			"lateness p90 was 6 ms, p99 7-16 ms, max 35 ms)", uplinkReseqHold)
+		log.Printf("downlink hub %s: uplink resequencer on, hold %s (measured "+
+			"lateness p90 was 6 ms, p99 7-16 ms, max 35 ms)", label, uplinkReseqHold)
 	}
 	context.AfterFunc(ctx, func() {
 		if h.reseq != nil {

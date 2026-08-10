@@ -1,7 +1,9 @@
 package main
 
 import (
+	"log"
 	"math/rand"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -538,6 +540,164 @@ func TestHoldPercentilesCoverTheReleasedPackets(t *testing.T) {
 		t.Fatalf("want 3 released packets in the hold stats: %q", line)
 	}
 	r.close()
+}
+
+// logSink captures the standard logger. It needs the mutex: the resequencer's
+// timer goroutine writes the promotion line, and the test reads it.
+type logSink struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (s *logSink) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *logSink) text() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+// 🎯 The rekey lifecycle must be LOGGED, not merely counted.
+//
+// `keypairs R/G` in conn-stats places a rotation somewhere inside a 2 s window,
+// which on 2026-08-10 was not enough to say whether a rotation preceded a
+// one-second stall in the client's trace or followed it. These three lines carry
+// the instants. The promotion line also re-guards the start-at-promotion fix
+// from the outside: it prints the start counter, which must be the LOWEST held
+// (3 here), not the first one seen (5).
+func TestGenerationLifecycleIsLogged(t *testing.T) {
+	// ⚠️ 200 ms, not 40: the four writes below must all land inside ONE hold or
+	// the rekey plays out differently, and 40 ms is not a safe margin for four
+	// unsynchronised writes on a loaded -race runner.
+	const hold = 200 * time.Millisecond
+	sink := &logSink{}
+	prev := log.Writer()
+	log.SetOutput(sink)
+	defer log.SetOutput(prev)
+
+	r, w := newReseq(t, hold)
+	_ = r.write(wgPkt(0xAAAA, 0)) // old keypair, out at once
+	_ = r.write(wgPkt(0xAAAA, 2)) // old keypair, held behind the gap at 1
+	_ = r.write(wgPkt(0xBBBB, 5)) // new keypair — queued, and the HIGH counter first
+	_ = r.write(wgPkt(0xBBBB, 3))
+
+	deadline := time.Now().Add(5 * time.Second)
+	for len(w.seen()) < 4 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if n := len(w.seen()); n != 4 {
+		t.Fatalf("released %d of 4 — the rekey did not complete, so the log cannot be read", n)
+	}
+	// Flush teardown into the SINK. t.Cleanup runs AFTER the deferred restore
+	// above, so without this the CLOSED line for the surviving generation goes
+	// to the terminal and the test silently reads a shorter log than it thinks.
+	r.close()
+
+	got := sink.text()
+	for _, want := range []string{
+		"keypair 0x0000aaaa opened at ctr 0",
+		"keypair 0x0000bbbb OPENED at ctr 5",
+		"QUEUED behind 1 generation(s), oldest 0x0000aaaa",
+		"keypair 0x0000aaaa CLOSED",
+		"keypair 0x0000bbbb PROMOTED",
+		"start ctr 3", // the LOWEST held, not the first seen (5) — the a5392ee fix
+		"2 pkts seen", // `seen` counts this keypair's packets
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("log is missing %q; got:\n%s", want, got)
+		}
+	}
+
+	// The CLOSED line's numbers are load-bearing, so assert them rather than the
+	// bare word: `%d pkts` pins `seen`, and a lifetime of at least one hold pins
+	// `firstSeen` to CREATION — stamped at close instead it would print ~0s.
+	m := regexp.MustCompile(`keypair 0x0000aaaa CLOSED after (\S+), (\d+) pkts`).FindStringSubmatch(got)
+	if m == nil {
+		t.Fatalf("CLOSED line does not carry a lifetime and a packet count:\n%s", got)
+	}
+	// ⚠️ BOTH ends of the range. A lower bound alone passes when firstSeen is the
+	// ZERO time — time.Since(zero) is ~2000 years, comfortably "at least one
+	// hold" — which is exactly the mutant that slipped through the first version
+	// of this assertion.
+	lifetime, err := time.ParseDuration(m[1])
+	if err != nil || lifetime < hold || lifetime > 30*time.Second {
+		t.Fatalf("CLOSED after %q (err %v) — must be at least %s (the quiet before a close) "+
+			"and less than this test's own runtime, so firstSeen is stamped at CREATION "+
+			"and is a real timestamp", m[1], err, hold)
+	}
+	if m[2] != "2" {
+		t.Fatalf("CLOSED reports %s pkts, want 2 — `seen` is not counting", m[2])
+	}
+
+	// Exactly one promotion. Two would mean an ordinary close was reported as a
+	// promotion; none would mean the queued side never reached the front.
+	if n := strings.Count(got, "PROMOTED"); n != 1 {
+		t.Fatalf("PROMOTED appears %d times, want 1:\n%s", n, got)
+	}
+	// Order matters as much as presence: a promotion logged before the close it
+	// waited for would mean the two sides of the rekey were not serialised.
+	iOpen := strings.Index(got, "keypair 0x0000bbbb OPENED")
+	iClose := strings.Index(got, "keypair 0x0000aaaa CLOSED")
+	iProm := strings.Index(got, "keypair 0x0000bbbb PROMOTED")
+	if !(iOpen < iClose && iClose < iProm) {
+		t.Fatalf("lines out of order (open %d, close %d, promote %d):\n%s", iOpen, iClose, iProm, got)
+	}
+}
+
+// 🚨 THE LIFECYCLE LOG MUST NOT BE DRIVEN BY THE PACKET RATE.
+//
+// Four lines per rekey is ~4 every 120 s. But genLocked's force-close loop fires
+// once per PACKET whose receiver index is not one of the three tracked, and each
+// iteration emits four lines — 4.00 per packet, measured, with r.mu held and
+// -logfile turning each into a synchronous write(2) inside the critical section
+// that every uplink writer contends on. `idx` comes straight out of the packet
+// with no WireGuard validation, so a remote peer sets that rate.
+func TestLifecycleLogIsRateLimited(t *testing.T) {
+	sink := &logSink{}
+	prev := log.Writer()
+	log.SetOutput(sink)
+	defer log.SetOutput(prev)
+
+	r, _ := newReseq(t, 100*time.Millisecond)
+	const n = 2000
+	for i := 0; i < n; i++ {
+		_ = r.write(wgPkt(uint32(0x10000+i), uint64(i))) // a fresh keypair every packet
+	}
+	got := sink.text()
+	// This test is only meaningful if it actually reaches the cascade.
+	if !strings.Contains(got, "force-closing the oldest") {
+		t.Fatalf("the force-close path was never taken, so nothing was tested:\n%s", got)
+	}
+	lines := strings.Count(got, "reseq[test]")
+	// ⚠️ An ABSOLUTE ceiling, deliberately not `k × reseqLogPerSec`: deriving the
+	// threshold from the constant under test means raising the constant also
+	// relaxes the assertion, and the sabotage run then stays green. If someone
+	// legitimately raises the budget past this, they should have to look at this
+	// line — that is the point of it.
+	const ceiling = 40 // one budget per second, a loop that runs in milliseconds
+	if lines > ceiling {
+		t.Fatalf("%d lines for %d packets (ceiling %d) — the budget did not bind", lines, n, ceiling)
+	}
+	if lines == 0 {
+		t.Fatal("no lines at all — the budget swallowed the signal instead of bounding it")
+	}
+	// Suppression must be VISIBLE. A cap that hides a storm is worse than no cap.
+	s := r.summaryAndReset()
+	dm := regexp.MustCompile(`log-drop (\d+)`).FindStringSubmatch(s)
+	if dm == nil {
+		t.Fatalf("the dump does not report suppressed lines: %s", s)
+	}
+	if dm[1] == "0" {
+		t.Fatalf("log-drop is 0 after %d packets of cascade — suppression is not counted: %s", n, s)
+	}
+	if again := r.summaryAndReset(); strings.Contains(again, "log-drop") &&
+		!strings.Contains(again, "log-drop 0") {
+		t.Fatalf("log-drop was not reset by the dump: %s", again)
+	}
 }
 
 func TestSummaryLineAndReset(t *testing.T) {

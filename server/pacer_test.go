@@ -190,7 +190,7 @@ func TestDownlinkHubWithPacerStillConservesAndFansOut(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hub, err := newDownlinkHub(ctx, wgSide.LocalAddr().String())
+	hub, err := newDownlinkHub(ctx, wgSide.LocalAddr().String(), "test")
 	if err != nil {
 		t.Fatalf("newDownlinkHub: %v", err)
 	}
