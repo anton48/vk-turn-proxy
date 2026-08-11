@@ -87,6 +87,23 @@ func main() {
 			"how much overshoot survives the pacer, so it is the whole point: "+
 			"too large and nothing is smoothed. 16 KiB is ~64 ms at the "+
 			"suggested rate. Ignored when -downlink-pace is 0.")
+	smallConns := flag.Int("downlink-small-conns", 0,
+		"route ACK-sized downlink packets over this many connections instead of "+
+			"work-stealing them across all of them. 0 = off = today's behaviour. "+
+			"THE EXPERIMENT (2026-08-11): reordering of the DATA is refuted as the "+
+			"upload limiter — the downlink is more disordered than the uplink "+
+			"(83.8% vs 78-80%) and carries 2.4x the throughput — but during an "+
+			"upload the ACKs coming down this hub are 71-75% out of order, and TCP "+
+			"is ACK-clocked. Sweep 1/2/4 against 0, back to back in one session. "+
+			"⚠️ Do not assume 1 is best: the measured ACK stream is ~240 KB/s "+
+			"against a 247-260 KiB/s per-allocation knee, so a single connection "+
+			"would sit AT the knee where 4.5% more offer costs 9.4% of throughput.")
+	smallSize := flag.Int("downlink-small-size", dlSmallSize,
+		"size in bytes at or below which a downlink packet takes the "+
+			"-downlink-small-conns path, measured as read off the WireGuard "+
+			"socket. A bare ACK is 84-145 B with WireGuard's 32 included; a data "+
+			"packet is ~1344. Widening this past ~200 stops testing the ACK path "+
+			"and starts pinning data, which is a different experiment.")
 	statsInterval := flag.Duration("conn-stats-interval", connStatsInterval,
 		"how often to dump the per-connection UP/DOWN table. The 60s default "+
 			"is fine for a running server, but a speedtest alternates download, "+
@@ -221,6 +238,14 @@ func main() {
 	// that does not keeps its own socket.
 	if *rcvBuf >= 0 {
 		dlReadBuffer = *rcvBuf * 1024
+	}
+	if *smallConns > 0 {
+		dlSmallConns, dlSmallSize = *smallConns, *smallSize
+		log.Printf("🎯 ACK-path experiment ON: downlink packets ≤ %d B go over "+
+			"%d connection(s) with priority instead of being work-stolen across "+
+			"all of them. Read the `small-path:` line in conn-stats — 0 routed "+
+			"means nothing was small enough and the run tested nothing.",
+			dlSmallSize, dlSmallConns)
 	}
 	if *singleClient {
 		log.Printf("⚠️  -single-client is ON: connections that send NO group "+

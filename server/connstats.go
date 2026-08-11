@@ -200,6 +200,17 @@ func (r *connRegistry) dump(dur time.Duration, label string) {
 			mean.Round(10*time.Microsecond))
 	}
 
+	// The ACK-path experiment. 🚨 Read `routed` first: ZERO means no packet was
+	// small enough to take the path, so the run did NOT test it — the same trap
+	// as "0 delayed writes" above. `fell back` climbing means the small queue is
+	// saturating and the fan-out is widening again behind your back, which would
+	// quietly turn a negative result into a run that never applied the treatment.
+	if dlSmallConns > 0 {
+		routed, fell := dlSmallRouted.Swap(0), dlSmallFellBack.Swap(0)
+		log.Printf("  small-path: %d routed, %d fell back, %d/%d writers, threshold %d B",
+			routed, fell, dlSmallWriters.Load(), dlSmallConns, dlSmallSize)
+	}
+
 	// Uplink reordering, over the same interval and from the same one consumer.
 	// Order matters: the merge-point reading first, then what the resequencer
 	// did, then the order WireGuard was actually handed. Read top to bottom the
