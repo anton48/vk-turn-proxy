@@ -63,9 +63,18 @@ func main() {
 			}
 			buf := make([]byte, 1<<16)
 			for {
+				// Idle reaper: when a probe run's tunnel COLLAPSES (e.g. F=64
+				// wedges the phone's networking), the client's FIN never
+				// arrives, so Read would block forever and the conn count would
+				// leak (stuck at 64, then 72 on the next run). Drop a connection
+				// that has gone silent for 15 s.
+				_ = c.SetReadDeadline(time.Now().Add(15 * time.Second))
 				n, err := c.Read(buf)
 				atomic.AddInt64(&total, int64(n))
 				if err != nil {
+					if ne, ok := err.(net.Error); ok && ne.Timeout() {
+						log.Printf("cwndsink: reaping idle conn (no data 15 s)")
+					}
 					return
 				}
 			}
