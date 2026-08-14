@@ -412,3 +412,51 @@ func TestReportedRateMatchesAKnownLossRate(t *testing.T) {
 		t.Fatalf("a clean drop pattern should not report jumps: %s", line)
 	}
 }
+
+// The per-index split is what lets a dose-response run tell the paced
+// synthetic's stream from the real one. Without it both are summed and the run
+// cannot say whose packets went missing.
+//
+// SEEN TO FAIL by keying the breakdown on a constant instead of the index: both
+// entries collapse to one and the second index is absent from the line.
+func TestLossIsAttributedByReceiverIndex(t *testing.T) {
+	s := newStats()
+	base := time.Now()
+	const synth = uint32(0x5D170000) // synth.go's own index
+	const real_ = uint32(0x11223344)
+	// The synthetic loses one; the real stream loses none.
+	for i := uint64(0); i < uint64(reorderDupWindow)+3000; i++ {
+		if i == 100 {
+			continue
+		}
+		s.observe(wgPkt(synth, i), base)
+	}
+	for i := uint64(0); i < 500; i++ {
+		s.observe(wgPkt(real_, i), base)
+	}
+	line := s.summaryLocked()
+	if !strings.Contains(line, "by-idx [") {
+		t.Fatalf("no per-index breakdown with two keypairs: %s", line)
+	}
+	if !strings.Contains(line, "5d170000:1/") {
+		t.Fatalf("the synthetic index should carry the single loss: %s", line)
+	}
+	if !strings.Contains(line, "11223344:0/500") {
+		t.Fatalf("the real index should be clean and separate: %s", line)
+	}
+}
+
+// With one keypair the breakdown would only repeat the totals, so it stays off.
+//
+// SEEN TO FAIL by printing it unconditionally: the line carries "by-idx" with a
+// single entry duplicating cum-lost.
+func TestNoPerIndexBreakdownForASingleKeypair(t *testing.T) {
+	s := newStats()
+	base := time.Now()
+	for i := uint64(0); i < 2000; i++ {
+		s.observe(wgPkt(9, i), base)
+	}
+	if line := s.summaryLocked(); strings.Contains(line, "by-idx") {
+		t.Fatalf("single keypair should not print a breakdown: %s", line)
+	}
+}

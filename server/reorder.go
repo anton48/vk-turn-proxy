@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -363,6 +365,27 @@ func (s *reorderStats) summaryLocked() string {
 	if expected > 0 {
 		cumPct = 100 * float64(cumLost) / float64(expected)
 	}
+	// 🎯 cum-lost SPLIT BY RECEIVER INDEX, printed only when more than one
+	// keypair carried traffic — which is exactly the synthetic-plus-real case.
+	// The paced synthetic (synth.go) stamps its own index precisely so its
+	// stream can be told apart here: with one aggregate number a dose-response
+	// run cannot say whose packets went missing. With a single index it would
+	// only repeat the totals, so it stays off.
+	byIdx := ""
+	if len(s.peers) > 1 {
+		parts := make([]string, 0, len(s.peers))
+		for idx, p := range s.peers {
+			exp := int64(p.max-p.first) + 1
+			if exp <= 0 {
+				continue
+			}
+			parts = append(parts, fmt.Sprintf("%08x:%d/%d", idx, exp-p.arrived, exp))
+		}
+		sort.Strings(parts)
+		if len(parts) > 0 {
+			byIdx = ", by-idx [" + strings.Join(parts, " ") + "]"
+		}
+	}
 	jumps := ""
 	if s.jumps > 0 {
 		// Printed only when it happened, because a jump wider than the window
@@ -375,5 +398,5 @@ func (s *reorderStats) summaryLocked() string {
 		histPct(dh, s.displaced, 0.50), histPct(dh, s.displaced, 0.90), histPct(dh, s.displaced, 0.99), s.maxDepth,
 		histPct(lh, s.displaced, 0.50), histPct(lh, s.displaced, 0.90), histPct(lh, s.displaced, 0.99),
 		s.maxLate.Round(time.Millisecond),
-		s.dup, s.stale, s.rekeys, s.lost, cumLost, expected, cumPct, jumps)
+		s.dup, s.stale, s.rekeys, s.lost, cumLost, expected, cumPct, byIdx+jumps)
 }
