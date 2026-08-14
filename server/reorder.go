@@ -90,6 +90,27 @@ type peerSeq struct {
 	maxAt time.Time
 	seen  []uint64  // bitmap ring over (max-reorderDupWindow, max]
 	last  time.Time // for idle pruning
+
+	// 🎯 THE LOSS MEASUREMENT, and the whole reason it can be exact: the counter
+	// is WireGuard's AEAD nonce, assigned by the SENDER, one per transport
+	// message and strictly increasing. So the counter SPAN says how many packets
+	// the phone put on the wire and `arrived` says how many reached this point —
+	// no framing to model, no clock to align, and no second counter counting a
+	// different population. That last one is why this field exists at all: on
+	// 2026-08-14 the phone's tx-pkt against this instrument's own packet count
+	// read 1.013, and I quoted it as "nothing is lost on the uplink" when the two
+	// sides count different populations (keepalives, background traffic) and the
+	// ratio resolves ~1-3% against a loss of 0.77%.
+	first   uint64 // first counter seen for this keypair; the span starts here
+	arrived int64  // counters actually seen (dups and stales excluded)
+	// lost accumulates counters that fell out of the dup window WITHOUT ever
+	// arriving. Deferred by up to reorderDupWindow packets by construction — a
+	// counter is only "lost" once it is too old to still be in flight.
+	lost int64
+	// jumps counts advances larger than the whole window. Loss cannot be
+	// attributed across one, so it is reported rather than folded in: a nonzero
+	// jumps means the lost figure of that interval is a lower bound.
+	jumps int64
 }
 
 func newPeerSeq(now time.Time) *peerSeq {
@@ -103,14 +124,28 @@ func (p *peerSeq) mark(c uint64) (dup bool, stale bool) {
 	if c > p.max {
 		// Advancing: clear the bits the window slides over, so a counter from a
 		// previous lap cannot masquerade as a duplicate.
+		//
+		// 🎯 AND THAT EVICTION IS EXACTLY WHERE LOSS BECOMES KNOWABLE. The bit at
+		// ring position x%W currently stands for counter x-W. If it is still
+		// CLEAR when the window slides past it, that counter never arrived and is
+		// now too old to be merely late — at the depths we measure (max 86) a
+		// packet 8128 counters behind the maximum is not in flight, it is gone.
 		gap := c - p.max
 		if gap >= reorderDupWindow {
+			// The window jumped clean over its own width. Everything in the ring
+			// is evicted at once and the counters in between were never even
+			// tracked, so no honest per-counter attribution is possible here.
+			p.jumps++
 			for i := range p.seen {
 				p.seen[i] = 0
 			}
 		} else {
 			for x := p.max + 1; x <= c; x++ {
 				idx := x % reorderDupWindow
+				if x >= reorderDupWindow && x-reorderDupWindow >= p.first &&
+					p.seen[idx/64]&(1<<(idx%64)) == 0 {
+					p.lost++
+				}
 				p.seen[idx/64] &^= 1 << (idx % 64)
 			}
 		}
@@ -139,6 +174,8 @@ type reorderStats struct {
 	dup       int64 // counter seen before — duplication, NOT reordering
 	stale     int64 // too far behind to classify
 	rekeys    int64 // new receiver index, i.e. a fresh keypair
+	lost      int64 // counters that left the window having never arrived
+	jumps     int64 // window advances wider than the window itself
 
 	depth    [reorderDepthBuckets + 1]int64
 	late     [reorderLateBuckets + 1]int64
@@ -183,9 +220,13 @@ func (s *reorderStats) observe(pkt []byte, now time.Time) {
 	if p == nil {
 		p = newPeerSeq(now)
 		p.max, p.maxAt = ctr, now
+		// The span starts where we started watching: counters below this were
+		// sent before the instrument existed and must not be scored as lost.
+		p.first = ctr
 		s.peers[idx] = p
 		s.rekeys++
 		s.total++
+		p.arrived++
 		_, _ = p.mark(ctr)
 		return
 	}
@@ -193,6 +234,12 @@ func (s *reorderStats) observe(pkt []byte, now time.Time) {
 	s.total++
 
 	dup, stale := p.mark(ctr)
+	// Drain whatever this call evicted, so the interval that OBSERVES the loss
+	// is the one that reports it and the series lines up with the throughput
+	// dips it is supposed to explain.
+	s.lost += p.lost
+	s.jumps += p.jumps
+	p.lost, p.jumps = 0, 0
 	switch {
 	case dup:
 		// A duplicate is duplication, not reordering. Counting it as displaced
@@ -204,6 +251,7 @@ func (s *reorderStats) observe(pkt []byte, now time.Time) {
 		s.stale++
 		return
 	}
+	p.arrived++
 	if ctr > p.max {
 		p.max, p.maxAt = ctr, now
 		return
@@ -270,6 +318,7 @@ func (s *reorderStats) dumpAndReset(now time.Time) {
 	s.mu.Lock()
 	line := s.summaryLocked()
 	s.total, s.displaced, s.dup, s.stale, s.rekeys = 0, 0, 0, 0, 0
+	s.lost, s.jumps = 0, 0
 	s.maxDepth, s.maxLate = 0, 0
 	for i := range s.depth {
 		s.depth[i] = 0
@@ -299,11 +348,32 @@ func (s *reorderStats) summaryLocked() string {
 	if s.label != "" {
 		tag = "uplink " + s.label
 	}
+	// Cumulative span across the keypairs still tracked: expected is what the
+	// SENDER numbered, arrived is what reached this point. This is the same
+	// quantity as `lost` by a different route — evictions give the per-interval
+	// series, the span gives a total that also covers whatever is still inside
+	// the window at the end of a run — and the two disagreeing is a defect.
+	var expected, arrived int64
+	for _, p := range s.peers {
+		expected += int64(p.max-p.first) + 1
+		arrived += p.arrived
+	}
+	cumLost := expected - arrived
+	cumPct := 0.0
+	if expected > 0 {
+		cumPct = 100 * float64(cumLost) / float64(expected)
+	}
+	jumps := ""
+	if s.jumps > 0 {
+		// Printed only when it happened, because a jump wider than the window
+		// means the interval's `lost` is a LOWER BOUND, not a measurement.
+		jumps = fmt.Sprintf(", jumps %d (lost is a lower bound)", s.jumps)
+	}
 	return fmt.Sprintf(
-		"  reorder(%s): %d pkts, %.1f%% out-of-order, depth p50/p90/p99/max %d/%d/%d/%d, late p50/p90/p99 %d/%d/%d ms (max %s), dup %d, stale %d, keypairs %d",
+		"  reorder(%s): %d pkts, %.1f%% out-of-order, depth p50/p90/p99/max %d/%d/%d/%d, late p50/p90/p99 %d/%d/%d ms (max %s), dup %d, stale %d, keypairs %d, lost %d, cum-lost %d of %d (%.2f%%)%s",
 		tag, s.total, share,
 		histPct(dh, s.displaced, 0.50), histPct(dh, s.displaced, 0.90), histPct(dh, s.displaced, 0.99), s.maxDepth,
 		histPct(lh, s.displaced, 0.50), histPct(lh, s.displaced, 0.90), histPct(lh, s.displaced, 0.99),
 		s.maxLate.Round(time.Millisecond),
-		s.dup, s.stale, s.rekeys)
+		s.dup, s.stale, s.rekeys, s.lost, cumLost, expected, cumPct, jumps)
 }

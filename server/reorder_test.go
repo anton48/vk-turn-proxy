@@ -242,3 +242,173 @@ func TestIdlePeersArePruned(t *testing.T) {
 		t.Fatalf("active keypair 2 was pruned")
 	}
 }
+
+// ─── Loss, measured from the SENDER's own counter space ──────────────────────
+//
+// 🚨 THESE GUARD A SILENT PROPERTY. Nothing in a log distinguishes "the packet
+// was late" from "the packet never came", and getting that wrong is what the
+// whole instrument exists to avoid: on 2026-08-14 a packet-count ratio of 1.013
+// was quoted as "nothing is lost on the uplink" when the real figure, proved by
+// receiver-side duplicates, was 0.77%. So each test below was run against a
+// sabotaged reorder.go and SEEN to fail — see the comment on each.
+
+// A clean, gapless stream longer than the dup window loses nothing.
+//
+// SEEN TO FAIL with the eviction check inverted (count a bit that IS set):
+// lost=2048, want 0.
+func TestLossIsZeroOnAGaplessStream(t *testing.T) {
+	s := newStats()
+	base := time.Now()
+	n := uint64(reorderDupWindow + 2048)
+	for i := uint64(0); i < n; i++ {
+		s.observe(wgPkt(1, i), base)
+	}
+	if s.lost != 0 {
+		t.Fatalf("gapless stream reported lost=%d, want 0", s.lost)
+	}
+	line := s.summaryLocked()
+	if !strings.Contains(line, "lost 0,") {
+		t.Fatalf("summary should carry lost 0: %s", line)
+	}
+	if !strings.Contains(line, "cum-lost 0 of") {
+		t.Fatalf("summary should carry cum-lost 0: %s", line)
+	}
+}
+
+// 🎯 THE ONE THAT MATTERS: a LATE packet is not a lost one. Counter `hole` is
+// skipped, delivered while still inside the window, and the window is then slid
+// well past it. Loss must stay 0 — otherwise every reordered packet on a fan-out
+// that runs 78-85% out of order would be reported as loss.
+//
+// SEEN TO FAIL by dropping the `p.seen[...] == 0` condition so every eviction
+// counts: lost=6000, want 0. That sabotage compiles.
+func TestLatePacketIsNotCountedAsLost(t *testing.T) {
+	s := newStats()
+	base := time.Now()
+	const hole = uint64(100)
+	for i := uint64(0); i < 4000; i++ {
+		if i == hole {
+			continue
+		}
+		s.observe(wgPkt(1, i), base)
+	}
+	s.observe(wgPkt(1, hole), base.Add(5*time.Millisecond)) // late, still in window
+	for i := uint64(4000); i < uint64(reorderDupWindow)+6000; i++ {
+		s.observe(wgPkt(1, i), base)
+	}
+	if s.lost != 0 {
+		t.Fatalf("a late arrival was counted as lost: lost=%d, want 0", s.lost)
+	}
+	if s.displaced == 0 {
+		t.Fatal("the late packet should still be counted as displaced")
+	}
+}
+
+// A counter that never arrives is counted exactly once, and only once the
+// window has slid past it — not before, or a packet still in flight would be
+// declared lost.
+//
+// SEEN TO FAIL by counting the gap at observe() time instead of at eviction:
+// lost=1 while still inside the window, want 0.
+func TestNeverArrivedIsCountedOnceAndOnlyAfterTheWindow(t *testing.T) {
+	s := newStats()
+	base := time.Now()
+	const hole = uint64(100)
+	for i := uint64(0); i < 4000; i++ {
+		if i == hole {
+			continue
+		}
+		s.observe(wgPkt(1, i), base)
+	}
+	if s.lost != 0 {
+		t.Fatalf("declared lost while still inside the window: lost=%d, want 0", s.lost)
+	}
+	// Slide the window a long way past the hole.
+	for i := uint64(4000); i < uint64(reorderDupWindow)+6000; i++ {
+		s.observe(wgPkt(1, i), base)
+	}
+	if s.lost != 1 {
+		t.Fatalf("lost=%d, want exactly 1", s.lost)
+	}
+	// The cumulative span agrees by a different route: one counter of the span
+	// never arrived.
+	if !strings.Contains(s.summaryLocked(), "cum-lost 1 of") {
+		t.Fatalf("cum-lost disagrees with lost: %s", s.summaryLocked())
+	}
+}
+
+// Duplicates must not be credited as arrivals, or a duplicated packet would
+// silently cancel out a lost one in the cumulative span.
+//
+// SEEN TO FAIL by moving p.arrived++ above the dup/stale switch: the summary
+// then reads cum-lost 0, want 1.
+func TestDuplicateDoesNotMaskALoss(t *testing.T) {
+	s := newStats()
+	base := time.Now()
+	const hole = uint64(100)
+	for i := uint64(0); i < 4000; i++ {
+		if i == hole {
+			continue
+		}
+		s.observe(wgPkt(1, i), base)
+	}
+	s.observe(wgPkt(1, 50), base) // a duplicate of one that already arrived
+	if s.dup != 1 {
+		t.Fatalf("dup=%d, want 1", s.dup)
+	}
+	for i := uint64(4000); i < uint64(reorderDupWindow)+6000; i++ {
+		s.observe(wgPkt(1, i), base)
+	}
+	if !strings.Contains(s.summaryLocked(), "cum-lost 1 of") {
+		t.Fatalf("a duplicate masked the loss: %s", s.summaryLocked())
+	}
+}
+
+// Counters sent BEFORE the instrument started watching are not loss. The ring
+// starts empty, so without the `first` guard the whole opening lap would be
+// reported as ~8128 lost packets on every fresh keypair.
+//
+// SEEN TO FAIL by removing the `x-reorderDupWindow >= p.first` condition:
+// lost=8127, want 0.
+func TestCountersBeforeWeStartedAreNotLoss(t *testing.T) {
+	s := newStats()
+	base := time.Now()
+	start := uint64(5_000_000) // join a stream already in progress
+	for i := start; i < start+uint64(reorderDupWindow)+2048; i++ {
+		s.observe(wgPkt(7, i), base)
+	}
+	if s.lost != 0 {
+		t.Fatalf("scored the pre-start lap as loss: lost=%d, want 0", s.lost)
+	}
+}
+
+// The number the run is actually for: a known loss rate must come back as
+// itself. 0.77% is the figure the receiver-side duplicate count proved on
+// 2026-08-14, and it is the size this instrument has to resolve — the packet
+// ratio it replaces could not (it reads to ~1-3%).
+func TestReportedRateMatchesAKnownLossRate(t *testing.T) {
+	s := newStats()
+	base := time.Now()
+	const n = uint64(200_000)
+	const dropEvery = 130 // ~0.77%
+	var dropped int64
+	for i := uint64(0); i < n; i++ {
+		if i > 0 && i%dropEvery == 0 {
+			dropped++
+			continue
+		}
+		s.observe(wgPkt(3, i), base)
+	}
+	line := s.summaryLocked()
+	want := 100 * float64(dropped) / float64(n)
+	got := 100 * float64(s.lost) / float64(n)
+	// The eviction series is deferred by one window, so the last ~8128 counters
+	// are not yet scored — that is the instrument being honest, not an error.
+	if got > want || want-got > 0.05 {
+		t.Fatalf("lost rate %.3f%% (%d), want ~%.3f%% (%d) minus at most one window\n%s",
+			got, s.lost, want, dropped, line)
+	}
+	if strings.Contains(line, "jumps") {
+		t.Fatalf("a clean drop pattern should not report jumps: %s", line)
+	}
+}
