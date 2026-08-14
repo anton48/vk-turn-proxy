@@ -19,9 +19,71 @@ import (
 	"flag"
 	"log"
 	"net"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
+
+// 🚨 THE RECEIVE WINDOW IS THIS SINK'S MOST DANGEROUS PROPERTY, AND IT LIED FOR
+// FIVE DEVICE SESSIONS. On 2026-08-14 a capture showed the advertised window
+// PINNED at 65 728 bytes — p05 60 864, p50 = p90 = p99 = max = 65 728, never
+// growing — which at srtt 118 ms bounds every inner flow at window/RTT =
+// 4.46 Mbit/s. F=4 is then bounded at 17.8 Mbit/s, and the runs measured
+// 16.3-17.2: the probe was reading THIS PROGRAM, not the tunnel. `winuse 3%` on
+// the phone was the signature all along (cwnd 33x in-flight, because in-flight
+// is pinned by the receiver).
+//
+// The old code asked for 8 MiB and IGNORED THE ERROR, under a comment that
+// named "the 64 KB rig trap" — so the guard against the trap is what re-created
+// it. On FreeBSD (this host) SO_RCVBUF is bounded by kern.ipc.maxsockbuf and a
+// request above it FAILS with ENOBUFS rather than being clamped, and an explicit
+// SO_RCVBUF also turns OFF the socket's SB_AUTOSIZE. Either way the outcome is
+// the same shape: a silently unchanged 64 KB default.
+//
+// So this no longer asks once and hopes. It walks DOWN a ladder until the
+// kernel accepts a size, READS BACK what it actually got, and LOGS it with the
+// per-flow bound it implies. An instrument that cannot report its own ceiling
+// has no business being the thing everything else is measured against.
+//
+// If nothing on the ladder is accepted, that is fine and is logged as such: a
+// failed SO_RCVBUF leaves auto-sizing ON, which is the better outcome anyway.
+// Sysctls that decide the ceiling on FreeBSD:
+//
+//	kern.ipc.maxsockbuf          hard cap on any SO_RCVBUF request
+//	net.inet.tcp.recvbuf_auto    1 = auto-sizing on (leave it on)
+//	net.inet.tcp.recvbuf_max     how far auto-sizing may grow
+//	net.inet.tcp.recvspace       the default this was stuck at (65 536)
+var rcvbufOnce sync.Once
+
+// rcvbufLadder is walked from the top down. 8 MiB at a 120 ms RTT is ~560
+// Mbit/s per flow, far past anything this path can do; the small end exists so
+// a conservative kern.ipc.maxsockbuf still gets us off the 64 KB default.
+var rcvbufLadder = []int{8 << 20, 4 << 20, 2 << 20, 1 << 20, 512 << 10, 256 << 10}
+
+// tuneRecvBuf enlarges the socket's receive buffer and reports what the kernel
+// actually granted. Returns the effective SO_RCVBUF, or 0 if it could not be
+// read.
+func tuneRecvBuf(tc *net.TCPConn) (want, got int, err error) {
+	for _, size := range rcvbufLadder {
+		if e := tc.SetReadBuffer(size); e == nil {
+			want = size
+			break
+		} else {
+			err = e
+		}
+	}
+	// Read back rather than trust the request: the number that matters is the
+	// one the kernel kept, and on some systems it is not the one we asked for.
+	if raw, e := tc.SyscallConn(); e == nil {
+		_ = raw.Control(func(fd uintptr) {
+			if v, e2 := syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF); e2 == nil {
+				got = v
+			}
+		})
+	}
+	return want, got, err
+}
 
 func main() {
 	addr := flag.String("listen", ":5202", "listen address (bind so the WG tunnel IP reaches it)")
@@ -56,10 +118,35 @@ func main() {
 			defer c.Close()
 			defer atomic.AddInt64(&conns, -1)
 			// Advertise a large receive window so the SENDER stays cwnd-limited,
-			// never rwnd-limited — otherwise a small default window reintroduces
-			// the 64 KB rig trap and caps the sender's flight below its cwnd.
+			// never rwnd-limited. 🚨 Read the block comment at the top of this
+			// file before touching this: the previous version of these three
+			// lines is what made every F<=8 probe number a measurement of this
+			// program's own 64 KB window.
 			if tc, ok := c.(*net.TCPConn); ok {
-				tc.SetReadBuffer(8 << 20)
+				want, got, err := tuneRecvBuf(tc)
+				rcvbufOnce.Do(func() {
+					// One line per RUN, not per connection — but it must be
+					// LOUD, because a silent ceiling here invalidates every
+					// per-flow number taken through this sink.
+					switch {
+					case got == 0:
+						log.Printf("cwndsink: ⚠️ SO_RCVBUF could not be read back "+
+							"(requested %d, last error %v) — per-flow numbers from "+
+							"this run are UNVERIFIED", want, err)
+					default:
+						// The bound a receive window imposes is window/RTT. At the
+						// ~120 ms this path runs at, print it in the units the
+						// experiment is scored in so nobody has to do the sum.
+						mbit := float64(got) * 8 / 0.120 / 1e6
+						note := ""
+						if mbit < 50 {
+							note = "  🚨 THIS BOUNDS EACH FLOW BELOW THE TUNNEL — raise " +
+								"kern.ipc.maxsockbuf / net.inet.tcp.recvbuf_max"
+						}
+						log.Printf("cwndsink: SO_RCVBUF effective %d bytes (requested %d) "+
+							"= ~%.0f Mbit/s per flow at 120 ms RTT%s", got, want, mbit, note)
+					}
+				})
 			}
 			buf := make([]byte, 1<<16)
 			for {
