@@ -61,6 +61,45 @@ var rcvbufOnce sync.Once
 // a conservative kern.ipc.maxsockbuf still gets us off the 64 KB default.
 var rcvbufLadder = []int{8 << 20, 4 << 20, 2 << 20, 1 << 20, 512 << 10, 256 << 10}
 
+// reportRecvBufCeiling walks the same ladder on a THROWAWAY socket at startup
+// and logs what the kernel will grant, so the ceiling is known BEFORE a run
+// rather than after its first packet.
+//
+// 🚨 That ordering is the whole lesson of 2026-08-14: the per-connection line
+// below would have exposed the 64 KB window too, but only once traffic was
+// already flowing — and a ceiling discovered after the fact costs the run. On
+// FreeBSD the effective cap is kern.ipc.maxsockbuf ADJUSTED DOWN for mbuf
+// overhead (sb_max_adj ~ sb_max * MCLBYTES/(MSIZE+MCLBYTES)), so a request for
+// exactly maxsockbuf is expected to fail and the ladder to settle one rung
+// lower. That is fine; what matters is that the number is printed.
+func reportRecvBufCeiling() {
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		log.Printf("cwndsink: ⚠️ could not probe the SO_RCVBUF ceiling: %v", err)
+		return
+	}
+	defer syscall.Close(fd)
+	want := 0
+	for _, size := range rcvbufLadder {
+		if syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, size) == nil {
+			want = size
+			break
+		}
+	}
+	got, err := syscall.GetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF)
+	if err != nil {
+		log.Printf("cwndsink: ⚠️ could not read back SO_RCVBUF: %v", err)
+		return
+	}
+	mbit := float64(got) * 8 / 0.120 / 1e6
+	note := ""
+	if mbit < 50 {
+		note = "  🚨 THIS BOUNDS EACH FLOW BELOW THE TUNNEL — raise kern.ipc.maxsockbuf"
+	}
+	log.Printf("cwndsink: receive-window ceiling %d bytes (largest of the ladder accepted: %d) "+
+		"= ~%.0f Mbit/s per flow at 120 ms RTT%s", got, want, mbit, note)
+}
+
 // tuneRecvBuf enlarges the socket's receive buffer and reports what the kernel
 // actually granted. Returns the effective SO_RCVBUF, or 0 if it could not be
 // read.
@@ -94,6 +133,8 @@ func main() {
 		log.Fatalf("cwndsink: listen %s: %v", *addr, err)
 	}
 	log.Printf("cwndsink: listening on %s — draining, reporting delivered goodput/s", *addr)
+	// Before anything connects: state the ceiling this instrument imposes.
+	reportRecvBufCeiling()
 
 	var total, conns int64
 
