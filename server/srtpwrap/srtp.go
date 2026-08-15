@@ -600,20 +600,31 @@ func (c *wrappedConn) Read(b []byte) (int, error) {
 			if cap(c.rxDecBuf) < len(pkt) {
 				c.rxDecBuf = make([]byte, 0, len(pkt)+64)
 			}
+			// Captured BEFORE the pool put below: after it, pkt may already
+			// have been handed to another goroutine and its length is not ours
+			// to read.
+			pktLen := len(pkt)
 			plain, err := c.decCtx.DecryptRTP(c.rxDecBuf[:0], pkt, nil)
 			// pkt's encrypted payload was decrypted into c.rxDecBuf — pkt
 			// itself is no longer needed regardless of err. Return to pool
 			// before any return/continue (mirror of iOS build 133).
 			pktPoolPut(pkt)
 			if err != nil {
+				// 🚨 COUNTED, because this drop is invisible everywhere else:
+				// it happens BEFORE the loss counter observes, so it surfaces
+				// downstream as a gap in the sender's counter space and reads
+				// as network loss. See qstats.go.
+				noteUnwrapDecryptFail(c.remote, pktLen, err)
 				continue
 			}
 			c.rxDecBuf = plain[:0]
 			var hdr rtp.Header
 			n, err := hdr.Unmarshal(plain)
 			if err != nil {
+				noteUnwrapHeaderFail(c.remote, pktLen, err)
 				continue
 			}
+			noteUnwrapDelivered()
 			return copy(b, plain[n:]), nil
 		case <-c.closed:
 			return 0, net.ErrClosed

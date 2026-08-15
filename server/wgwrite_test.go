@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"log"
 	"strings"
 	"testing"
@@ -30,6 +31,9 @@ func resetWGWrite() {
 	for i := range wgWriteBuckets {
 		wgWriteBuckets[i].Store(0)
 	}
+	// UnwrapStats is itself read-and-reset, so calling it IS the reset — and it
+	// keeps the test from reaching into another package's private counters.
+	srtpwrap.UnwrapStats()
 }
 
 // Percentiles are lower bucket edges, so the ordering holds by construction and
@@ -103,6 +107,51 @@ func TestWGWriteShoutsWhenTheDemuxDropped(t *testing.T) {
 	out := captureWG(t, dumpWGWriteAndReset)
 	if !strings.Contains(out, "DROPPED") || !strings.Contains(out, "UPSTREAM") {
 		t.Fatalf("a demux drop must be shouted, and must say where it lands:\n%s", out)
+	}
+}
+
+// 🚨 THE TRAP THIS TEST EXISTS FOR, and it was nearly shipped. The unwrap
+// counters are read-and-reset, and the dump returns early when the wg-write half
+// has nothing. If they were read AFTER that early return, an interval whose only
+// event was a dropped packet would print nothing AND clear nothing, so the drop
+// would surface in some later interval or not at all — an instrument that loses
+// exactly the event it was built to catch.
+//
+// SABOTAGE SEEN TO FAIL: move the `srtpwrap.UnwrapStats()` call in
+// dumpWGWriteAndReset below the `if total == 0 && ...` early return (and drop
+// the three counters from that condition). Compiles; this test then gets
+// silence.
+func TestUnwrapIsReportedEvenWhenTheWGWriteHalfIsIdle(t *testing.T) {
+	resetWGWrite()
+	srtpwrap.NoteUnwrapDelivered()
+	srtpwrap.NoteUnwrapDecryptFail(nil, 1200, errors.New("auth tag"))
+
+	out := captureWG(t, dumpWGWriteAndReset)
+	if !strings.Contains(out, "srtp-unwrap:") || !strings.Contains(out, "1 decrypt-fail") {
+		t.Fatalf("a drop with no wg-write activity must still be reported:\n%s", out)
+	}
+	if out := captureWG(t, dumpWGWriteAndReset); out != "" {
+		t.Fatalf("expected silence after the reset, got:\n%s", out)
+	}
+}
+
+// A failure count without its denominator is a number nobody can size, and a
+// drop here is counted downstream as network loss — so the line has to carry the
+// SHARE and say where the packets end up being blamed.
+//
+// SABOTAGE SEEN TO FAIL: set `unwrapNote` to "" and add `_ = unwrapNote` so it
+// still compiles (deleting the variable outright does not — unused variable,
+// which validates the compiler rather than the test).
+func TestUnwrapShareIsShoutedWhenSomethingFailed(t *testing.T) {
+	resetWGWrite()
+	for i := 0; i < 999; i++ {
+		srtpwrap.NoteUnwrapDelivered()
+	}
+	srtpwrap.NoteUnwrapDecryptFail(nil, 1200, errors.New("auth tag"))
+
+	out := captureWG(t, dumpWGWriteAndReset)
+	if !strings.Contains(out, "0.1000%") || !strings.Contains(out, "network loss") {
+		t.Fatalf("expected the share and where it is blamed:\n%s", out)
 	}
 }
 

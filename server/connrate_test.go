@@ -96,9 +96,14 @@ func TestOverKneeCountsConnsNotSamples(t *testing.T) {
 	feed(s, 1,
 		connRateReading{id: 1, bytes: hot / 10, pkts: 1},
 		connRateReading{id: 2, bytes: hot / 10, pkts: 1})
+	// 🚨 conn 2 goes QUIET in the second window (+10 bytes, not another hot
+	// tick). The first version of this test gave both connections the same
+	// second tick, so both crossed twice — a TIE, whose winner came out of Go's
+	// randomised map order. It passed about two runs in three, and the flake was
+	// the test telling the truth about an unspecified tie-break.
 	feed(s, 2,
 		connRateReading{id: 1, bytes: 2 * hot / 10, pkts: 2},
-		connRateReading{id: 2, bytes: 2 * hot / 10, pkts: 1})
+		connRateReading{id: 2, bytes: hot/10 + 10, pkts: 1})
 
 	out := capture(t, s.dumpAndReset)
 	if !strings.Contains(out, "on 2 of 2 conns") {
@@ -106,6 +111,32 @@ func TestOverKneeCountsConnsNotSamples(t *testing.T) {
 	}
 	if !strings.Contains(out, "worst conn 1 with 2") {
 		t.Fatalf("expected conn 1 named as the worst with 2 samples in:\n%s", out)
+	}
+}
+
+// 🚨 AND THE TIE ITSELF MUST BE DETERMINISTIC. Two connections with the same
+// count is the ordinary case at high load, and a line that names a different one
+// on every dump invites exactly the wrong reading — "it rotates, so nothing is
+// structurally hot" — from an artefact of map iteration.
+//
+// The loop is the test: one dump can pass on luck, fifty cannot.
+//
+// SABOTAGE SEEN TO FAIL: drop the `|| (n == worstConnN && ...)` clause from
+// dumpAndReset, i.e. restore the plain `n > worstConnN`. Compiles; this test
+// then fails within a few iterations.
+func TestWorstConnIsDeterministicOnATie(t *testing.T) {
+	hot := int64(connRateKneeBytes * 2)
+	for i := 0; i < 50; i++ {
+		s := newConnRateSampler()
+		feed(s, 0, connRateReading{id: 7}, connRateReading{id: 3}, connRateReading{id: 5})
+		feed(s, 1,
+			connRateReading{id: 7, bytes: hot / 10, pkts: 1},
+			connRateReading{id: 3, bytes: hot / 10, pkts: 1},
+			connRateReading{id: 5, bytes: hot / 10, pkts: 1})
+		out := capture(t, s.dumpAndReset)
+		if !strings.Contains(out, "worst conn 3 with 1") {
+			t.Fatalf("iteration %d: a tie must resolve to the lowest id:\n%s", i, out)
+		}
 	}
 }
 

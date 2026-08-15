@@ -69,6 +69,69 @@ func noteDTLSDrop(src interface{}) {
 	log.Printf("srtpwrap: dropped DTLS packet from %v (dtlsCh full)", src)
 }
 
+// THE SECOND SILENT DROP, AND IT WAS UNCOUNTED UNTIL 2026-08-15.
+//
+// 🎯 WHY THIS EXISTS. `wrappedConn.Read` discards a packet on two error paths —
+// `DecryptRTP` failing and the RTP header failing to unmarshal — and both were a
+// bare `continue`. The loss counter observes in `main.go` AFTER this Read, so a
+// packet dropped here is never counted as arrived and appears downstream as a
+// GAP IN THE SENDER'S COUNTER SPACE: indistinguishable from a packet lost on the
+// network, which is exactly the quantity the uplink-loss investigation is
+// measuring. The exclusion "the server is uninvolved" rested on the demux queue
+// depth and on netstat, and NEITHER of them covers this path. *(User-raised.)*
+//
+// ⚠️ A failure here is not automatically OUR bug — a packet corrupted in transit
+// fails authentication too, and that IS network loss. What the counters settle
+// is which of the two it is, and until they exist the question cannot even be
+// asked. Note also that outer replay protection is NOT a candidate: the contexts
+// are built by `srtp.CreateContext` with no replay option, so pion's default of
+// no replay protection applies.
+//
+// 🚨 `delivered` is here as the DENOMINATOR. A failure count without it is a
+// number nobody can size, and this project has already published one of those.
+var (
+	unwrapDelivered   atomic.Int64
+	unwrapDecryptFail atomic.Int64
+	unwrapHeaderFail  atomic.Int64
+	unwrapDetailLogs  atomic.Int64
+)
+
+// unwrapDetailBudget caps the per-process detail lines. A systematic failure
+// would otherwise write one line per packet at thousands per second and bury the
+// log that has to be read afterwards; the aggregate carries the rest.
+const unwrapDetailBudget = 5
+
+func noteUnwrapDelivered() { unwrapDelivered.Add(1) }
+
+func noteUnwrapDecryptFail(src interface{}, n int, err error) {
+	unwrapDecryptFail.Add(1)
+	logUnwrapDetail("SRTP decrypt", src, n, err)
+}
+
+func noteUnwrapHeaderFail(src interface{}, n int, err error) {
+	unwrapHeaderFail.Add(1)
+	logUnwrapDetail("RTP header unmarshal", src, n, err)
+}
+
+// logUnwrapDetail names the first few failures. The KIND of failure is what
+// separates "the wire corrupted it" from "our unwrap is wrong", and an aggregate
+// count cannot carry it.
+func logUnwrapDetail(what string, src interface{}, n int, err error) {
+	if unwrapDetailLogs.Add(1) > unwrapDetailBudget {
+		return
+	}
+	log.Printf("srtpwrap: %s FAILED for a %d-byte packet from %v: %v — 🚨 this packet "+
+		"is dropped BEFORE the server's loss counter observes it, so it appears "+
+		"downstream as a gap in the sender's counter space and is indistinguishable "+
+		"there from network loss (only the first %d such lines are printed)",
+		what, n, src, err, unwrapDetailBudget)
+}
+
+// UnwrapStats reports and RESETS what the SRTP unwrap delivered and dropped.
+func UnwrapStats() (delivered, decryptFail, headerFail int64) {
+	return unwrapDelivered.Swap(0), unwrapDecryptFail.Swap(0), unwrapHeaderFail.Swap(0)
+}
+
 // QueueStats reports and RESETS the peak depth and the drop counts. Returns the
 // capacity too, because a depth without its denominator is not a reading.
 func QueueStats() (peak, drops, dtls int64, capacity int) {
@@ -82,3 +145,8 @@ func QueueStats() (peak, drops, dtls int64, capacity int) {
 // transport API and nothing in the data path should call them.
 func NoteRTPDrop(src interface{}) { noteRTPDrop(src) }
 func NoteRTPEnqueued(depth int)   { noteRTPEnqueued(depth) }
+
+// Same reason, for the unwrap counters.
+func NoteUnwrapDelivered()                              { noteUnwrapDelivered() }
+func NoteUnwrapDecryptFail(src interface{}, n int, e error) { noteUnwrapDecryptFail(src, n, e) }
+func NoteUnwrapHeaderFail(src interface{}, n int, e error)  { noteUnwrapHeaderFail(src, n, e) }

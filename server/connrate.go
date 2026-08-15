@@ -273,7 +273,14 @@ func (s *connRateSampler) dumpAndReset() {
 	worstConn, worstConnN := 0, int64(0)
 	for id, n := range s.overByConn {
 		over += n
-		if n > worstConnN {
+		// 🚨 THE TIE MUST BREAK THE SAME WAY EVERY TIME. Go randomises map
+		// iteration, so without the id comparison two connections with equal
+		// counts would put a DIFFERENT name in the log on every dump — and the
+		// first question anyone asks of this line is "is it the same connection
+		// each time?". An instrument that answers that question at random is
+		// worse than one that does not answer it. (Found 2026-08-15 by a test of
+		// mine that was itself passing on luck.)
+		if n > worstConnN || (n == worstConnN && worstConnN > 0 && id < worstConn) {
 			worstConn, worstConnN = id, n
 		}
 	}

@@ -104,11 +104,31 @@ func dumpWGWriteAndReset() {
 	}
 	maxD := time.Duration(wgWriteMaxNs.Swap(0))
 	peak, drops, dtls, capacity := srtpwrap.QueueStats()
+	// 🚨 Read UNCONDITIONALLY, before the silence check below: these are
+	// read-and-reset counters, so a dump that returns early without reading them
+	// would carry an interval's failures into the next interval's numbers.
+	delivered, decFail, hdrFail := srtpwrap.UnwrapStats()
 
-	if total == 0 && peak == 0 && drops == 0 && dtls == 0 {
+	if total == 0 && peak == 0 && drops == 0 && dtls == 0 && delivered == 0 && decFail == 0 && hdrFail == 0 {
 		// Silence rather than a row of zeros: an instrument that prints zeros
 		// when it has nothing cannot be told from one that measured zero.
 		return
+	}
+
+	// THE SRTP UNWRAP, on its own line because it is a different story: not how
+	// long we held a packet, but whether we silently threw it away upstream of
+	// the loss counter. ⚠️ The zeros here are PRINTED whenever traffic flowed —
+	// that is the point, since this line exists to turn "we never looked" into
+	// "we looked and it was zero".
+	if delivered > 0 || decFail > 0 || hdrFail > 0 {
+		unwrapNote := ""
+		if decFail > 0 || hdrFail > 0 {
+			unwrapNote = fmt.Sprintf(" 🚨 %.4f%% of arrivals DROPPED IN OUR UNWRAP — these are "+
+				"counted downstream as network loss",
+				100*float64(decFail+hdrFail)/float64(delivered+decFail+hdrFail))
+		}
+		log.Printf("  srtp-unwrap: %d delivered, %d decrypt-fail, %d header-fail%s",
+			delivered, decFail, hdrFail, unwrapNote)
 	}
 
 	note := ""
