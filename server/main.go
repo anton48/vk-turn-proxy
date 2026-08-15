@@ -111,6 +111,15 @@ func main() {
 			"computed over 60s are not the shares during the download burst. "+
 			"Drop this to 2s-5s when measuring, and read the logged KB/s "+
 			"directly rather than deriving rates from shares.")
+	rateSample := flag.Duration("conn-rate-sample", connRateInterval,
+		"how often to sample each connection's INSTANTANEOUS uplink rate. The "+
+			"conn-stats table is an average over its whole interval, and a 2s "+
+			"average cannot resolve the sub-second overshoot that a token bucket "+
+			"clips on — which is precisely why the burst form of VK's meter "+
+			"survives while its rate-clip form is refuted. Samples are never "+
+			"logged individually: the distribution, the over-knee count and a "+
+			"few timestamped worst windows ride the conn-stats dump. 0 turns it "+
+			"off, and then a null on burst clipping means nothing.")
 	reorderStats := flag.Bool("reorder-stats", true,
 		"measure how badly the client's connections deliver its uplink out of "+
 			"order, using WireGuard's cleartext per-packet counter, and report "+
@@ -231,6 +240,11 @@ func main() {
 	statsDone := make(chan struct{})
 	defer close(statsDone)
 	go runConnStatsLoop(statsDone)
+
+	// The 100 ms per-connection rate sampler. Its output rides the conn-stats
+	// dump, so it is bounded by that interval rather than by its own.
+	connRateInterval = *rateSample
+	go runConnRateLoop(statsDone)
 
 	// M1+M3: the shared-socket downlink scheduler. Hubs are now created on
 	// demand, one per client group, so nothing is allocated here — a client
@@ -635,6 +649,10 @@ func pumpBidirectional(ctx context.Context, conn net.Conn, connect string, singl
 				return
 			}
 			st.up.Add(int64(n))
+			// Counted beside the bytes because the policer meters WIRE bytes and
+			// the packet count is the only way to add the ~30 B/packet of framing
+			// back → connrate.go.
+			st.upPkts.Add(1)
 		}
 	}()
 

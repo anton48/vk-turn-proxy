@@ -40,6 +40,12 @@ type connStat struct {
 	remote string
 	up     atomic.Int64
 	down   atomic.Int64
+	// upPkts exists for ONE reason: the policer meters WIRE bytes, and the wire
+	// size of an uplink packet is its payload plus ~30 B of framing. Without a
+	// packet count there is no way to turn `up` into the quantity the meter
+	// actually counts, and every "% of the knee" computed from bytes alone is
+	// low by 2-3%. → connrate.go
+	upPkts atomic.Int64
 	// Pacer instrumentation (M2b). Without these there is no way to tell a
 	// pacer that is shaping the traffic from one whose rate is set so high it
 	// never blocks — the two look identical in the byte counters.
@@ -215,6 +221,12 @@ func (r *connRegistry) dump(dur time.Duration, label string) {
 	// Order matters: the merge-point reading first, then what the resequencer
 	// did, then the order WireGuard was actually handed. Read top to bottom the
 	// three lines are the before, the work, and the after.
+	// The instantaneous per-connection rate, at the sampler's own resolution
+	// rather than this interval's. It belongs directly under the summary above,
+	// because the two are the SAME quantity at two resolutions and the whole
+	// point is that they disagree: a 71% average can hide 130% peaks.
+	connRate.dumpAndReset()
+
 	now := time.Now()
 	uplinkReorder.dumpAndReset(now)
 	dumpResequencers()
