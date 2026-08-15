@@ -310,14 +310,18 @@ func (s *Server) demux() {
 			select {
 			case sess.dtlsCh <- pkt:
 			default:
-				log.Printf("srtpwrap: dropped DTLS packet from %s (dtlsCh full)", src)
+				noteDTLSDrop(src)
 				pktPoolPut(pkt)
 			}
 		case IsRTP(pkt[0]):
 			select {
 			case sess.rtpCh <- pkt:
+				// Sampled here rather than on a timer: the depth that matters
+				// is the one an arriving packet finds, and a timer would mostly
+				// sample the quiet gaps between bursts.
+				noteRTPEnqueued(len(sess.rtpCh))
 			default:
-				log.Printf("srtpwrap: dropped RTP packet from %s (rtpCh full)", src)
+				noteRTPDrop(src)
 				pktPoolPut(pkt)
 			}
 		default:

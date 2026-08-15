@@ -639,11 +639,17 @@ func pumpBidirectional(ctx context.Context, conn net.Conn, connect string, singl
 			// M5: when the group has a resequencer, WireGuard is reached only
 			// through it, so the order it computes is the order WireGuard sees.
 			// Ungrouped connections do not merge with anything and go direct.
+			//
+			// Timed because this is the pump's own delay, and the pump is what
+			// drains the demux queue whose overflow would look like network
+			// loss to the counter two lines above → wgwrite.go.
+			w0 := time.Now()
 			if b.hub != nil && b.hub.reseq != nil {
 				err1 = b.hub.reseq.write(buf[:n])
 			} else {
 				_, err1 = b.wg.Write(buf[:n])
 			}
+			observeWGWrite(time.Since(w0))
 			if err1 != nil {
 				log.Printf("inbound write failed: %s", err1)
 				return

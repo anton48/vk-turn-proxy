@@ -227,6 +227,12 @@ func (r *connRegistry) dump(dur time.Duration, label string) {
 	// point is that they disagree: a 71% average can hide 130% peaks.
 	connRate.dumpAndReset()
 
+	// The server's own hand-off delay and the demux queue it drains. Placed
+	// before the reorder lines because it covers the leg BETWEEN the socket and
+	// the point where those lines count: if this queue ever overflows, its
+	// drops appear there as network loss.
+	dumpWGWriteAndReset()
+
 	now := time.Now()
 	uplinkReorder.dumpAndReset(now)
 	dumpResequencers()
