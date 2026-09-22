@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -183,6 +184,114 @@ func TestAZombieBesideALiveNeighbourIsReapedEarly(t *testing.T) {
 	}
 }
 
+// THE WAKE'S BURST (2026-09-22 evening, five healthy connections reaped). Two
+// members ping together, the whole group sleeps 450 ms — longer than the zombie's
+// silence — and wakes: A pings first, B 90 ms later. At the ticks between the
+// two, B is silent beyond reapZombieAfter beside a neighbour heard just now —
+// the old rule's zombie — but the group has only just woken: B is a member a
+// moment behind the burst, and stays.
+func TestALateMemberOfTheWakesBurstIsNotAZombie(t *testing.T) {
+	sleep := 450 * time.Millisecond
+	tick := 100 * time.Millisecond
+	a := newPacedConn(pace(0, 0, tick, tick, sleep, tick, tick, tick, tick, tick, tick, tick, tick), talk(0x77, 12)...)
+	b := newPacedConn(pace(0, 0, tick, tick, sleep+90*time.Millisecond, tick, tick, tick, tick, tick, tick, tick, tick), talk(0x77, 12)...)
+	before := reapsByReason[reapZombie].Load()
+	doneA, stopA := pump(t, a)
+	defer stopA()
+	doneB, stopB := pump(t, b)
+	defer stopB()
+	if ended(doneB, 1200*time.Millisecond) {
+		t.Fatal("a member a moment behind the wake's burst was reaped as a zombie")
+	}
+	if ended(doneA, 0) {
+		t.Fatal("the member that woke the group was reaped")
+	}
+	if n := reapsByReason[reapZombie].Load() - before; n != 0 {
+		t.Fatalf("zombie reaps counted: %d, want 0", n)
+	}
+}
+
+// And the rule still finds a real zombie after a wake: the same sleep, A wakes
+// and keeps pinging, B never speaks again — reaped as a zombie once the group
+// has been awake for zombieAwakeFor (not at the burst), and before the backstop.
+func TestARealZombieIsReapedOnceItsGroupHasBeenAwake(t *testing.T) {
+	sleep := 450 * time.Millisecond
+	tick := 100 * time.Millisecond
+	a := newPacedConn(pace(0, 0, tick, tick, sleep, tick, tick, tick, tick, tick, tick, tick, tick), talk(0x78, 12)...)
+	b := newPacedConn(pace(0, 0, tick, tick), talk(0x78, 3)...) // pings with A, then silence for ever
+	before := reapsByReason[reapZombie].Load()
+	doneA, stopA := pump(t, a)
+	defer stopA()
+	doneB, stopB := pump(t, b)
+	defer stopB()
+	// A's wake ping lands at ≈650 ms; the grace runs to ≈800 ms.
+	if ended(doneB, 750*time.Millisecond) {
+		t.Fatal("the silent member was reaped at the wake's burst, before the group had been awake for the grace")
+	}
+	// B's own backstop is at ≈1000 ms (its last inbound at 200 ms); the zombie
+	// verdict must come before it.
+	if !ended(doneB, 200*time.Millisecond) {
+		t.Fatal("a member silent while its group has been awake beyond the grace was not reaped before the backstop")
+	}
+	if ended(doneA, 0) {
+		t.Fatal("the live member was reaped too")
+	}
+	if n := reapsByReason[reapZombie].Load() - before; n != 1 {
+		t.Fatalf("zombie reaps counted: %d, want 1 — was it the backstop instead?", n)
+	}
+}
+
+// pace turns waits into a paced conn's script; talk is a hello and n probes.
+func pace(d ...time.Duration) []time.Duration { return d }
+func talk(group byte, n int) [][]byte {
+	pkts := [][]byte{hello(group)}
+	for seq := uint64(1); seq <= uint64(n); seq++ {
+		pkts = append(pkts, probe(seq))
+	}
+	return pkts
+}
+
+// The hub's clock of the wake: an inbound that ends a gap longer than the
+// client's ping interval moves awakeSince; the ordinary inter-ping gaps do not;
+// and a burst of members stamping at once moves it once, onto the burst.
+func TestTheGroupWakesOnTheInboundThatEndsItsSleep(t *testing.T) {
+	h := &downlinkHub{}
+	t0 := time.Now().UnixNano()
+	h.lastInbound.Store(t0)
+	h.awakeSince.Store(t0)
+	ms := func(n int) int64 { return t0 + int64(n)*int64(time.Millisecond) }
+	for _, n := range []int{20, 40, 60, 80, 100} { // pings 20 ms apart: awake, not waking
+		h.heard(ms(n))
+	}
+	if h.awakeSince.Load() != t0 {
+		t.Fatal("ordinary inter-ping gaps moved the wake stamp")
+	}
+	h.heard(ms(100 + 149)) // a gap just short of groupSleepGap (150 ms): not a sleep
+	if h.awakeSince.Load() != t0 {
+		t.Fatal("a gap short of groupSleepGap counted as a sleep")
+	}
+	h.heard(ms(249 + 150)) // exactly the gap: a sleep ended
+	if h.awakeSince.Load() != ms(399) {
+		t.Fatal("the inbound that ended a sleep did not move the wake stamp")
+	}
+	// The wake's burst: forty members stamp at once after a long silence.
+	var wg sync.WaitGroup
+	for i := 0; i < 40; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			h.heard(ms(2000 + i))
+		}(i)
+	}
+	wg.Wait()
+	if got := h.awakeSince.Load(); got < ms(2000) || got > ms(2039) {
+		t.Fatalf("after the burst the wake stamp is %d ms off the burst", (got-ms(2000))/int64(time.Millisecond))
+	}
+	if got := h.lastInbound.Load(); got < ms(2000) || got > ms(2039) {
+		t.Fatal("the group's last inbound is not the burst's")
+	}
+}
+
 // A group that is wholly silent is NOT a zombie's — it is reaped at the backstop
 // exactly as before, and not a moment earlier: with repeats going out, silence
 // that long means they did not wake the client. 🚫 And never kept longer: a
@@ -302,7 +411,7 @@ func TestTheClockworksRules(t *testing.T) {
 	t0 := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
 	mk := func() *clockwork {
 		return &clockwork{after: 45 * time.Second, every: 60 * time.Second,
-			zombie: 90 * time.Second, neighbour: 60 * time.Second, idle: 150 * time.Second}
+			zombie: 90 * time.Second, neighbour: 60 * time.Second, awakeFor: 45 * time.Second, idle: 150 * time.Second}
 	}
 	at := func(s float64) time.Time { return t0.Add(time.Duration(s * float64(time.Second))) }
 	type step struct {
@@ -379,6 +488,26 @@ func TestTheClockworksRules(t *testing.T) {
 		in.superseded = true
 		run(t, cw, []step{{"superseded: reaped at once, no repeat, whatever the silence", in, false, reapSuperseded}})
 	})
+	t.Run("the wake's burst: a zombie needs its group AWAKE for a ping interval and a tick", func(t *testing.T) {
+		woke := func(now, last, group, awake float64) clockworkInput {
+			in := grouped(now, last, group, true)
+			in.groupAwakeSince = at(awake)
+			return in
+		}
+		run(t, mk(), []step{
+			{"the group woke 1 s ago after a 104-s sleep; this member silent 105 s, the neighbour heard 0 s ago → NOT a zombie (a second behind the burst): a repeat instead", woke(105, 0, 105, 104), true, reapNone},
+			{"the group awake 44 s, still silent (148 s: short of the backstop) → not yet", woke(148, 0, 148, 104), false, reapNone},
+			{"the group awake 45 s and this member still silent → a zombie", woke(149, 0, 149, 104), false, reapZombie},
+		})
+		run(t, mk(), []step{
+			{"no sleep on record (a zero awake stamp): the rule as before", grouped(91, 0, 60, true), false, reapZombie},
+		})
+		cw := mk()
+		cw.awakeFor = 0
+		run(t, cw, []step{
+			{"the grace switched off (-zombie-awake 0): the rule as before, at the wake", woke(105, -6, 105, 104), false, reapZombie},
+		})
+	})
 	t.Run("an ungrouped connection is never reaped but is kept alive", func(t *testing.T) {
 		run(t, mk(), []step{
 			{"silent 400 s, per-conn mode", clockworkInput{now: at(400), lastInbound: at(0), haveEcho: true}, true, reapNone},
@@ -428,6 +557,25 @@ func TestTheNumbersAsShipped(t *testing.T) {
 	}
 	if defaultKeepaliveEvery >= 150*time.Second || defaultKeepaliveAfter+2*defaultKeepaliveEvery >= 300*time.Second {
 		t.Fatal("the repeats must come faster than the 150-s reaper and twice inside a 300-s NAT state")
+	}
+	if defaultZombieAwakeFor != 45*time.Second || defaultGroupSleepGap != 45*time.Second {
+		t.Fatalf("the wake's grace moved: %s awake, a sleep from %s", defaultZombieAwakeFor, defaultGroupSleepGap)
+	}
+	// The grace is a ping interval + a tick: the time every healthy member of a
+	// group that just woke needs to have spoken; a zombie found at a wake still
+	// goes before the backstop; a sleep is the silence that earns a repeat —
+	// clearly above the ping interval, so an awake group's gaps never count;
+	// and the margin between the zombie's silence and the neighbour window is
+	// the ping interval — what keeps a member from looking like a zombie while
+	// its whole group sleeps. (The client's 30-s ping interval, the reaper's
+	// 15-s tick and 150-s backstop are literals here: the vars are shrunk by
+	// TestMain before this runs.)
+	if defaultZombieAwakeFor != 30*time.Second+15*time.Second ||
+		defaultReapZombieAfter+defaultZombieAwakeFor >= 150*time.Second ||
+		defaultGroupSleepGap != defaultKeepaliveAfter || defaultGroupSleepGap <= 30*time.Second ||
+		defaultReapZombieAfter-defaultZombieNeighbourWithin != 30*time.Second {
+		t.Fatalf("the grace, the tick, the zombie's silence and the neighbour window do not fit: %s / %s / %s / %s",
+			defaultZombieAwakeFor, defaultReapZombieAfter, defaultZombieNeighbourWithin, defaultGroupSleepGap)
 	}
 }
 

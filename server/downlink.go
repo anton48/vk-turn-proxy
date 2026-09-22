@@ -185,11 +185,26 @@ type downlinkHub struct {
 	smallCh chan dlPacket
 	reseq   *resequencer // nil unless -uplink-reseq is set
 	// lastInbound is when ANY member of this group was last heard from — stamped
-	// by every member's inbound pump beside its own — and superseded is set when
-	// the client says it has left this group (keepalive.go). Both are what lets
-	// the reaper tell a zombie from a sleeping client and from a switch.
+	// by every member's inbound pump beside its own (heard) — awakeSince is
+	// when the group last WOKE (the inbound that ended a gap of groupSleepGap or
+	// more — a sleep), and superseded is set when the client says it has left
+	// this group (keepalive.go). The three are what lets the reaper tell a
+	// zombie from a sleeping client, from a member a second behind the wake's
+	// burst, and from a switch.
 	lastInbound atomic.Int64
+	awakeSince  atomic.Int64
 	superseded  atomic.Bool
+}
+
+// heard stamps an inbound from any member of the group — and, when it ends a
+// silence of the WHOLE group of groupSleepGap or more (a sleep: well above the
+// client's ping interval), the moment the group woke. One atomic swap decides which inbound ended the gap, so a
+// burst of forty pumps stamping at once moves awakeSince exactly once.
+func (h *downlinkHub) heard(nowNs int64) {
+	prev := h.lastInbound.Swap(nowNs)
+	if nowNs-prev >= int64(groupSleepGap) {
+		h.awakeSince.Store(nowNs)
+	}
 }
 
 // label identifies the GROUP in this hub's log lines. Every group dials the same
@@ -237,7 +252,9 @@ func newDownlinkHub(ctx context.Context, connect, label string) (*downlinkHub, e
 		ch:      make(chan dlPacket, dlQueueSize),
 		smallCh: make(chan dlPacket, dlQueueSize),
 	}
-	h.lastInbound.Store(time.Now().UnixNano())
+	now := time.Now().UnixNano()
+	h.lastInbound.Store(now)
+	h.awakeSince.Store(now)
 	// The resequencer belongs to the GROUP, because a group is exactly the set
 	// of connections that merge — and merging unequal-latency paths is what
 	// shuffles the uplink. A connection on its own private socket has nothing to

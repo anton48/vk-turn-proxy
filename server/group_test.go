@@ -28,6 +28,11 @@ func TestMain(m *testing.M) {
 	keepaliveEvery = 150 * time.Millisecond
 	reapZombieAfter = 400 * time.Millisecond
 	zombieNeighbourWithin = 300 * time.Millisecond
+	// The wake's grace: a zombie needs its group awake 150 ms (a ticking client's
+	// 100-ms interval + a 50-ms tick) since the inbound that ended a gap of 150 ms
+	// or more (a sleep — clearly above the ticking interval and its jitter).
+	zombieAwakeFor = 150 * time.Millisecond
+	groupSleepGap = 150 * time.Millisecond
 	os.Exit(m.Run())
 }
 
@@ -39,7 +44,8 @@ type scriptedConn struct {
 	got    [][]byte
 	gotAt  []time.Time // when each write arrived — the keepalive's timing is the point
 	every  time.Duration
-	failAt int // writes fail from this count on, when > 0 (a dead relay leg)
+	delays []time.Duration // per-packet waits, when set (a client that sleeps and wakes); `every` otherwise
+	failAt int             // writes fail from this count on, when > 0 (a dead relay leg)
 	closed chan struct{}
 	once   sync.Once
 }
@@ -55,12 +61,24 @@ func newTickingConn(every time.Duration, pkts ...[]byte) *scriptedConn {
 	c.every = every
 	return c
 }
+
+// newPacedConn plays each packet after its own wait — a client that pings,
+// sleeps and wakes on a script.
+func newPacedConn(delays []time.Duration, pkts ...[]byte) *scriptedConn {
+	c := newScriptedConn(pkts...)
+	c.delays = delays
+	return c
+}
 func (s *scriptedConn) Read(b []byte) (int, error) {
 	s.mu.Lock()
 	if len(s.in) > 0 {
 		p := s.in[0]
 		s.in = s.in[1:]
 		every := s.every
+		if len(s.delays) > 0 {
+			every = s.delays[0]
+			s.delays = s.delays[1:]
+		}
 		s.mu.Unlock()
 		if every > 0 {
 			select {

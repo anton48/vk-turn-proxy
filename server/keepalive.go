@@ -48,7 +48,20 @@ import (
 // Two things it could not tell before, it can now:
 //   - a member silent for reapZombieAfter while a NEIGHBOUR in the same group
 //     was heard within zombieNeighbourWithin is a zombie — its client is awake
-//     and talking, just not on this connection — and goes EARLIER than 150 s;
+//     and talking, just not on this connection — and goes EARLIER than 150 s.
+//     🚫 Not at the moment the group WAKES: after a sleep every member's silence
+//     is the sleep's length, and the first pings of the wake's burst make the
+//     neighbour condition true while the rest are still in flight — five
+//     healthy connections were reaped that way a second after a 104-s sleep
+//     (2026-09-22 evening). So the group keeps the moment it woke (awakeSince:
+//     the inbound that ended a gap of groupSleepGap — the silence that earns a
+//     repeat, well above the client's 30-s ping interval, so that an awake
+//     group's ordinary gaps never count), and a zombie is reaped only once its
+//     group has been awake for zombieAwakeFor — a ping interval plus a tick,
+//     the time every healthy member needs to have spoken. The margin between
+//     reapZombieAfter and zombieNeighbourWithin is the ping interval, which is
+//     what keeps a member from looking like a zombie while the whole group
+//     sleeps;
 //   - a group the client has SUPERSEDED (it says so with a sentinel on the
 //     connections of its new group after a network switch — see
 //     isGroupSupersede) goes at the next tick, so no repeat is ever sent into
@@ -58,14 +71,17 @@ import (
 //     address the relay has recycled for another allocation would deliver the
 //     repeat to a stranger's session.
 //
-// THE NUMBERS are the user's (2026-09-22): 45 / 60 / 90 s. Vars, not consts, so
-// that main() can set them from flags and a test can shrink them — written once
-// before any connection exists, read-only afterwards (the reaper's contract).
+// THE NUMBERS are the user's (2026-09-22): 45 / 60 / 90 s, and the wake's grace
+// of 45 s from the evening's field result. Vars, not consts, so that main() can
+// set them from flags and a test can shrink them — written once before any
+// connection exists, read-only afterwards (the reaper's contract).
 const (
 	defaultKeepaliveAfter        = 45 * time.Second // silence before the first repeat
 	defaultKeepaliveEvery        = 60 * time.Second // between repeats while the silence lasts; 0 = no repeats at all
 	defaultReapZombieAfter       = 90 * time.Second // a member silent this long beside a heard neighbour is a zombie
 	defaultZombieNeighbourWithin = 60 * time.Second // ...if the group heard another member this recently
+	defaultZombieAwakeFor        = 45 * time.Second // ...and only once the group has been awake this long: a ping interval + a tick; 0 = the rule without the grace
+	defaultGroupSleepGap         = 45 * time.Second // a gap in the group's inbound this long is a sleep (the silence that earns a repeat, well above the 30-s ping interval); the inbound that ends it is the wake
 )
 
 var (
@@ -73,6 +89,8 @@ var (
 	keepaliveEvery        = defaultKeepaliveEvery
 	reapZombieAfter       = defaultReapZombieAfter
 	zombieNeighbourWithin = defaultZombieNeighbourWithin
+	zombieAwakeFor        = defaultZombieAwakeFor
+	groupSleepGap         = defaultGroupSleepGap
 )
 
 // groupSupersedeMagic is the sentinel a client sends on the connections of its
@@ -188,7 +206,7 @@ func (r reapReason) String() string {
 // three reaper rules — as a table over the clocks it reads, with the knobs
 // captured at construction so that the rules can be tested without a goroutine.
 type clockwork struct {
-	after, every, zombie, neighbour, idle time.Duration
+	after, every, zombie, neighbour, awakeFor, idle time.Duration
 
 	lastRepeat time.Time // zero until the first repeat
 }
@@ -196,17 +214,18 @@ type clockwork struct {
 func newClockwork() *clockwork {
 	return &clockwork{
 		after: keepaliveAfter, every: keepaliveEvery,
-		zombie: reapZombieAfter, neighbour: zombieNeighbourWithin,
+		zombie: reapZombieAfter, neighbour: zombieNeighbourWithin, awakeFor: zombieAwakeFor,
 		idle: groupIdleTimeout,
 	}
 }
 
 // clockworkInput is what one tick reads: when this connection was last heard,
-// when its group last heard ANY member (zero when ungrouped), whether the group
-// was superseded, and whether an echo exists to repeat.
+// when its group last heard ANY member and when it last WOKE (both zero when
+// ungrouped), whether the group was superseded, and whether an echo exists to
+// repeat.
 type clockworkInput struct {
-	now, lastInbound, groupLastInbound time.Time
-	grouped, superseded, haveEcho      bool
+	now, lastInbound, groupLastInbound, groupAwakeSince time.Time
+	grouped, superseded, haveEcho                       bool
 }
 
 // step decides one tick. The reaper's verdict comes first: a connection that is
@@ -219,7 +238,8 @@ func (c *clockwork) step(in clockworkInput) (repeat bool, reap reapReason) {
 		switch {
 		case in.superseded:
 			return false, reapSuperseded
-		case idle > c.zombie && !in.groupLastInbound.IsZero() && in.now.Sub(in.groupLastInbound) < c.neighbour:
+		case idle > c.zombie && !in.groupLastInbound.IsZero() && in.now.Sub(in.groupLastInbound) < c.neighbour &&
+			c.groupAwake(in):
 			return false, reapZombie
 		case idle > c.idle:
 			return false, reapIdle
@@ -232,6 +252,14 @@ func (c *clockwork) step(in clockworkInput) (repeat bool, reap reapReason) {
 		return false, reapNone
 	}
 	return true, reapNone
+}
+
+// groupAwake says whether the group has been awake long enough for a silent
+// member to be a zombie rather than a late waker: zombieAwakeFor since the
+// inbound that ended the group's last sleep. A zero awake stamp (no sleep on
+// record) or a grace of 0 is the rule without it.
+func (c *clockwork) groupAwake(in clockworkInput) bool {
+	return c.awakeFor <= 0 || in.groupAwakeSince.IsZero() || in.now.Sub(in.groupAwakeSince) >= c.awakeFor
 }
 
 // repeated stamps the repeat that was WRITTEN — one the gate held back (the
@@ -284,6 +312,9 @@ func runClockwork(ctx context.Context, conn net.Conn, st *connStat, lastInbound 
 				if ns := h.lastInbound.Load(); ns != 0 {
 					in.groupLastInbound = time.Unix(0, ns)
 				}
+				if ns := h.awakeSince.Load(); ns != 0 {
+					in.groupAwakeSince = time.Unix(0, ns)
+				}
 				in.superseded = h.superseded.Load()
 			}
 			repeat, reap := cw.step(in)
@@ -292,8 +323,9 @@ func runClockwork(ctx context.Context, conn net.Conn, st *connStat, lastInbound 
 				switch reap {
 				case reapZombie:
 					log.Printf("conn %d: no inbound for %s while its group heard another "+
-						"connection %s ago — a zombie, reaping", st.id, idle,
-						now.Sub(in.groupLastInbound).Round(time.Second))
+						"connection %s ago and has been awake for %s — a zombie, reaping", st.id, idle,
+						now.Sub(in.groupLastInbound).Round(time.Second),
+						now.Sub(in.groupAwakeSince).Round(time.Second))
 				case reapSuperseded:
 					log.Printf("conn %d: its group was superseded by the client's new group "+
 						"(silent %s) — reaping", st.id, idle)

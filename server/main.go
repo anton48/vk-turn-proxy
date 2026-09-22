@@ -158,6 +158,14 @@ func main() {
 			"its connections in the last minute is a zombie and is reaped now, "+
 			"instead of at the 150-s backstop: its client is awake and talking. A "+
 			"wholly silent group still waits for the backstop.")
+	zombieAwake := flag.Duration("zombie-awake", zombieAwakeFor,
+		"...and only once the group has been AWAKE this long — since the inbound "+
+			"that ended a silence of the whole group of 45 s or more (a sleep; the "+
+			"client pings every 30 s awake). At a wake every member is silent for the sleep's length "+
+			"and the first pings of the burst would make the rest look like zombies "+
+			"(five healthy connections were reaped that way a second after a 104-s "+
+			"sleep); a ping interval plus a tick is the time every healthy member "+
+			"needs to have spoken. 0 = the zombie rule without this grace.")
 	logFile := flag.String("logfile", "",
 		"if set, append log output to this file instead of stdout. The "+
 			"file is opened in append mode (O_APPEND|O_CREATE) so logs from "+
@@ -166,7 +174,7 @@ func main() {
 	flag.Parse()
 	reorderStatsEnabled = *reorderStats
 	uplinkReseqHold = *reseqHold
-	keepaliveAfter, keepaliveEvery, reapZombieAfter = *kaAfter, *kaEvery, *reapZombie
+	keepaliveAfter, keepaliveEvery, reapZombieAfter, zombieAwakeFor = *kaAfter, *kaEvery, *reapZombie, *zombieAwake
 
 	if *logFile != "" {
 		f, err := os.OpenFile(*logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
@@ -279,9 +287,10 @@ func main() {
 	}
 	if keepaliveEvery > 0 {
 		log.Printf("keepalive: the last probe echo is repeated into a connection silent for %s, "+
-			"then every %s; a member silent %s beside a neighbour heard within %s is reaped "+
-			"as a zombie, a wholly silent group at %s as before", keepaliveAfter, keepaliveEvery,
-			reapZombieAfter, zombieNeighbourWithin, groupIdleTimeout)
+			"then every %s; a member silent %s beside a neighbour heard within %s, in a group "+
+			"awake for %s, is reaped as a zombie, a wholly silent group at %s as before",
+			keepaliveAfter, keepaliveEvery, reapZombieAfter, zombieNeighbourWithin, zombieAwakeFor,
+			groupIdleTimeout)
 	} else {
 		log.Printf("⚠️  keepalive is OFF (-keepalive-every 0): a sleeping UDP phone is not woken "+
 			"by this server and is reaped after %s of silence", groupIdleTimeout)
@@ -626,7 +635,7 @@ func pumpBidirectional(ctx context.Context, conn net.Conn, connect string, singl
 			nowNs := time.Now().UnixNano()
 			lastInbound.Store(nowNs)
 			if b := bind.Load(); b.hub != nil {
-				b.hub.lastInbound.Store(nowNs)
+				b.hub.heard(nowNs)
 			}
 
 			// Group hello (M3): consume it, never forward it. Checked before
