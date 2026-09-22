@@ -52,6 +52,11 @@ type connStat struct {
 	downPkts  atomic.Int64 // writes attempted on the downlink
 	pacedPkts atomic.Int64 // ...of which had to wait for tokens
 	pacedNs   atomic.Int64 // total time spent waiting
+	// The keepalive (keepalive.go): repeats of the last echo sent into this
+	// connection's silences, and the reason its reaper ended it (a reapReason,
+	// 0 while it lives).
+	keepalives atomic.Int64
+	reaped     atomic.Int64
 }
 
 type connRegistry struct {
@@ -206,6 +211,12 @@ func (r *connRegistry) dump(dur time.Duration, label string) {
 			mean.Round(10*time.Microsecond))
 	}
 
+	// The keepalive and the reaper, since the start: the repeats say the silences
+	// were seen, the reasons say what ended the connections that ended — the
+	// numbers to set beside a client log's kills and re-dials.
+	log.Printf("  keepalive: %d repeat(s) sent, %d write(s) failed; reaped: %d idle, %d zombie, %d superseded (since start)",
+		keepaliveRepeats.Load(), keepaliveWriteFails.Load(),
+		reapsByReason[reapIdle].Load(), reapsByReason[reapZombie].Load(), reapsByReason[reapSuperseded].Load())
 	// The ACK-path experiment. 🚨 Read `routed` first: ZERO means no packet was
 	// small enough to take the path, so the run did NOT test it — the same trap
 	// as "0 delayed writes" above. `fell back` climbing means the small queue is

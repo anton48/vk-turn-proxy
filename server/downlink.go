@@ -184,6 +184,12 @@ type downlinkHub struct {
 	// Always allocated so the routing code needs no nil check on a hot path.
 	smallCh chan dlPacket
 	reseq   *resequencer // nil unless -uplink-reseq is set
+	// lastInbound is when ANY member of this group was last heard from — stamped
+	// by every member's inbound pump beside its own — and superseded is set when
+	// the client says it has left this group (keepalive.go). Both are what lets
+	// the reaper tell a zombie from a sleeping client and from a switch.
+	lastInbound atomic.Int64
+	superseded  atomic.Bool
 }
 
 // label identifies the GROUP in this hub's log lines. Every group dials the same
@@ -231,6 +237,7 @@ func newDownlinkHub(ctx context.Context, connect, label string) (*downlinkHub, e
 		ch:      make(chan dlPacket, dlQueueSize),
 		smallCh: make(chan dlPacket, dlQueueSize),
 	}
+	h.lastInbound.Store(time.Now().UnixNano())
 	// The resequencer belongs to the GROUP, because a group is exactly the set
 	// of connections that merge — and merging unequal-latency paths is what
 	// shuffles the uplink. A connection on its own private socket has nothing to

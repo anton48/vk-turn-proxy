@@ -143,6 +143,21 @@ func main() {
 			"leaves 11.3% of the output still displaced and manufactures bursts "+
 			"of late releases. Nothing is ever dropped: a packet whose slot has "+
 			"already been released is forwarded late rather than discarded.")
+	kaAfter := flag.Duration("keepalive-after", keepaliveAfter,
+		"repeat the last probe echo into a connection that has been silent this "+
+			"long — a byte-for-byte repeat of a pong the client already accepted, "+
+			"never an invented one — so that a sleeping UDP phone is woken and its "+
+			"NAT state, its relay permission and this server's reaper are all kept "+
+			"from running out behind it. Over TCP the relay's own 60-s probe does "+
+			"this already; over UDP nothing did. See keepalive.go.")
+	kaEvery := flag.Duration("keepalive-every", keepaliveEvery,
+		"between repeats while the silence lasts. 0 turns the repeats OFF — the "+
+			"behaviour before this flag existed; the reaper's new rules stay.")
+	reapZombie := flag.Duration("reap-zombie", reapZombieAfter,
+		"a grouped connection silent this long while the group heard ANOTHER of "+
+			"its connections in the last minute is a zombie and is reaped now, "+
+			"instead of at the 150-s backstop: its client is awake and talking. A "+
+			"wholly silent group still waits for the backstop.")
 	logFile := flag.String("logfile", "",
 		"if set, append log output to this file instead of stdout. The "+
 			"file is opened in append mode (O_APPEND|O_CREATE) so logs from "+
@@ -151,6 +166,7 @@ func main() {
 	flag.Parse()
 	reorderStatsEnabled = *reorderStats
 	uplinkReseqHold = *reseqHold
+	keepaliveAfter, keepaliveEvery, reapZombieAfter = *kaAfter, *kaEvery, *reapZombie
 
 	if *logFile != "" {
 		f, err := os.OpenFile(*logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
@@ -260,6 +276,15 @@ func main() {
 			"all of them. Read the `small-path:` line in conn-stats — 0 routed "+
 			"means nothing was small enough and the run tested nothing.",
 			dlSmallSize, dlSmallConns)
+	}
+	if keepaliveEvery > 0 {
+		log.Printf("keepalive: the last probe echo is repeated into a connection silent for %s, "+
+			"then every %s; a member silent %s beside a neighbour heard within %s is reaped "+
+			"as a zombie, a wholly silent group at %s as before", keepaliveAfter, keepaliveEvery,
+			reapZombieAfter, zombieNeighbourWithin, groupIdleTimeout)
+	} else {
+		log.Printf("⚠️  keepalive is OFF (-keepalive-every 0): a sleeping UDP phone is not woken "+
+			"by this server and is reaped after %s of silence", groupIdleTimeout)
 	}
 	if *singleClient {
 		log.Printf("⚠️  -single-client is ON: connections that send NO group "+
@@ -534,10 +559,14 @@ func pumpBidirectional(ctx context.Context, conn net.Conn, connect string, singl
 	bindCtx, bindCancel := context.WithCancel(ctx2)
 	defer bindCancel()
 
-	// lastInbound feeds the idle reaper. Updated on EVERY successful read,
-	// including probe pings and hellos, because a connection carrying nothing
-	// but probes is alive and must not be reaped.
-	var lastInbound atomic.Int64
+	// lastInbound feeds the idle reaper and the keepalive. Updated on EVERY
+	// successful read, including probe pings and hellos, because a connection
+	// carrying nothing but probes is alive and must not be reaped. echo keeps
+	// the last probe echoed — the only thing the keepalive may repeat.
+	var (
+		lastInbound atomic.Int64
+		echo        lastEcho
+	)
 	lastInbound.Store(time.Now().UnixNano())
 
 	// promote moves this connection from its initial binding to its client's
@@ -592,13 +621,28 @@ func pumpBidirectional(ctx context.Context, conn net.Conn, connect string, singl
 			}
 			// Any successful read is proof of life for the reaper, including
 			// probes and hellos — a connection carrying nothing else is alive.
-			lastInbound.Store(time.Now().UnixNano())
+			// The group's own stamp beside it: the reaper tells a zombie from a
+			// sleeping client by whether the NEIGHBOURS were heard (keepalive.go).
+			nowNs := time.Now().UnixNano()
+			lastInbound.Store(nowNs)
+			if b := bind.Load(); b.hub != nil {
+				b.hub.lastInbound.Store(nowNs)
+			}
 
 			// Group hello (M3): consume it, never forward it. Checked before
 			// the probe gate only because both are cheap constant-time tests on
 			// the same leading 0xff.
 			if key, ok := isGroupHello(buf[:n]); ok {
 				promote(key)
+				continue
+			}
+			// Supersede sentinel (keepalive.go): the client names the group it
+			// has just left, on a connection of its new one. Consumed, never
+			// forwarded; the group it names is reaped at its members' next tick.
+			// A connection naming its own group, or a group already gone, is a
+			// no-op — never a reason to touch this connection.
+			if old, ok := isGroupSupersede(buf[:n]); ok {
+				groups.supersede(old, bind.Load().key)
 				continue
 			}
 			// Probe-echo: the iOS client sends a 12-byte sentinel
@@ -621,6 +665,9 @@ func pumpBidirectional(ctx context.Context, conn net.Conn, connect string, singl
 					log.Printf("probe-echo write failed: %s", err1)
 					return
 				}
+				// Kept for the keepalive: what was just echoed is what may be
+				// repeated into this connection's next silence, byte for byte.
+				echo.set(buf[:n])
 				continue
 			}
 			// Measured HERE, at the merge point, because this is where the
@@ -678,38 +725,30 @@ func pumpBidirectional(ctx context.Context, conn net.Conn, connect string, singl
 			} else {
 				pumpPrivateDownlink(serveCtx, conn, b.wg, st)
 			}
-			if bind.Load() == b {
+			// A genuine exit is one that no promotion caused. The binding is
+			// compared AND the promotion's cancel is asked: between promote's
+			// bind.Store and its bindCancel this goroutine can already have
+			// loaded the NEW binding and entered it under the old context — the
+			// cancel then ends that run, the bindings compare equal, and the
+			// connection was torn down at the moment it joined its group.
+			if bind.Load() == b && bindCtx.Err() == nil {
 				return // nothing was swapped under us: a genuine exit
+			}
+			if serveCtx == ctx2 {
+				return // the run under the group's own context ended: genuine
 			}
 			serveCtx = ctx2 // promotion is one-shot; no further rebinding
 		}
 	}()
 
-	// Idle reaper (M3). Only meaningful in group mode: a per-conn connection
-	// that goes silent hurts nobody, but one inside a group keeps stealing from
-	// the shared queue and dropping what it steals.
-	go func() {
-		t := time.NewTicker(groupReapEvery)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx2.Done():
-				return
-			case <-t.C:
-				if bind.Load().hub == nil {
-					continue
-				}
-				idle := time.Since(time.Unix(0, lastInbound.Load()))
-				if idle > groupIdleTimeout {
-					log.Printf("conn %d: no inbound for %s, reaping — a silent "+
-						"connection in a group still steals downlink",
-						st.id, idle.Round(time.Second))
-					cancel2()
-					return
-				}
-			}
-		}
-	}()
+	// The connection's clockwork (keepalive.go): the keepalive repeat into a
+	// silence, and the idle reaper (M3) — only meaningful in group mode: a
+	// per-conn connection that goes silent hurts nobody, but one inside a group
+	// keeps stealing from the shared queue and dropping what it steals — with
+	// the two rules the keepalive made possible: a zombie beside heard
+	// neighbours, and a group the client says it has left.
+	go runClockwork(ctx2, conn, st, &lastInbound, &echo,
+		func() *downlinkHub { return bind.Load().hub }, cancel2)
 	wg.Wait()
 	log.Printf("Connection closed: %s\n", conn.RemoteAddr())
 }

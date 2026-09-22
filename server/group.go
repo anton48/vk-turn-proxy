@@ -157,6 +157,27 @@ func (r *hubRegistry) release(key groupKey) {
 		key, len(r.hubs))
 }
 
+// supersede marks `old` as left behind by the client that now uses `by`: its
+// members are reaped at their next tick and no keepalive is repeated into it
+// (keepalive.go). The old id is a 16-byte random draw that only its own client
+// knows, so naming it IS the proof. A sentinel naming the sender's own group,
+// or a group that does not exist, does nothing — the first would let a client
+// cut itself off by mistake, the second is a lost or late sentinel.
+func (r *hubRegistry) supersede(old, by groupKey) bool {
+	if old == by {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.hubs[old]
+	if !ok || e.hub.superseded.Swap(true) {
+		return false
+	}
+	log.Printf("group %s: superseded by the client's new group %s — its %d connection(s) "+
+		"will be reaped at their next tick", old, by, e.refs)
+	return true
+}
+
 // binding is what a connection currently forwards through. It is swapped at
 // most once per connection, when a group hello arrives, and both the inbound
 // and outbound goroutines read it — hence the atomic rather than a mutex on a

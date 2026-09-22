@@ -20,6 +20,14 @@ import (
 func TestMain(m *testing.M) {
 	groupIdleTimeout = 800 * time.Millisecond
 	groupReapEvery = 50 * time.Millisecond
+	// The keepalive's knobs (keepalive.go), under the same once-only contract.
+	// Chosen so that a silent connection sees its first repeat well before the
+	// reaper (200 < 800), a zombie goes clearly before the backstop (400 < 800)
+	// and a neighbour "recently heard" means within a few ticks.
+	keepaliveAfter = 200 * time.Millisecond
+	keepaliveEvery = 150 * time.Millisecond
+	reapZombieAfter = 400 * time.Millisecond
+	zombieNeighbourWithin = 300 * time.Millisecond
 	os.Exit(m.Run())
 }
 
@@ -29,6 +37,9 @@ type scriptedConn struct {
 	mu     sync.Mutex
 	in     [][]byte
 	got    [][]byte
+	gotAt  []time.Time // when each write arrived — the keepalive's timing is the point
+	every  time.Duration
+	failAt int // writes fail from this count on, when > 0 (a dead relay leg)
 	closed chan struct{}
 	once   sync.Once
 }
@@ -37,12 +48,27 @@ func newScriptedConn(pkts ...[]byte) *scriptedConn {
 	return &scriptedConn{in: pkts, closed: make(chan struct{})}
 }
 
+// newTickingConn plays its packets one every `every` — a client that keeps
+// talking — and then blocks like a scriptedConn.
+func newTickingConn(every time.Duration, pkts ...[]byte) *scriptedConn {
+	c := newScriptedConn(pkts...)
+	c.every = every
+	return c
+}
 func (s *scriptedConn) Read(b []byte) (int, error) {
 	s.mu.Lock()
 	if len(s.in) > 0 {
 		p := s.in[0]
 		s.in = s.in[1:]
+		every := s.every
 		s.mu.Unlock()
+		if every > 0 {
+			select {
+			case <-time.After(every):
+			case <-s.closed:
+				return 0, net.ErrClosed
+			}
+		}
 		return copy(b, p), nil
 	}
 	s.mu.Unlock()
@@ -51,9 +77,20 @@ func (s *scriptedConn) Read(b []byte) (int, error) {
 }
 func (s *scriptedConn) Write(b []byte) (int, error) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failAt > 0 && len(s.got) >= s.failAt {
+		return 0, net.ErrClosed
+	}
 	s.got = append(s.got, append([]byte(nil), b...))
-	s.mu.Unlock()
+	s.gotAt = append(s.gotAt, time.Now())
 	return len(b), nil
+}
+
+// writes returns a copy of everything written so far, with the times.
+func (s *scriptedConn) writes() ([][]byte, []time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([][]byte(nil), s.got...), append([]time.Time(nil), s.gotAt...)
 }
 func (s *scriptedConn) Close() error {
 	s.once.Do(func() { close(s.closed) })
