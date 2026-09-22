@@ -251,27 +251,27 @@ func talk(group byte, n int) [][]byte {
 	return pkts
 }
 
-// The hub's clock of the wake: an inbound that ends a gap longer than the
-// client's ping interval moves awakeSince; the ordinary inter-ping gaps do not;
-// and a burst of members stamping at once moves it once, onto the burst.
+// The hub's clock of the wake: an inbound that ends a gap of groupSleepGap or
+// more moves awakeSince; the ordinary inter-ping gaps do not; and a burst of
+// members stamping at once moves it once, onto the burst.
 func TestTheGroupWakesOnTheInboundThatEndsItsSleep(t *testing.T) {
 	h := &downlinkHub{}
 	t0 := time.Now().UnixNano()
-	h.lastInbound.Store(t0)
-	h.awakeSince.Store(t0)
+	h.clock.Store(&groupClock{lastInbound: t0, awakeSince: t0})
 	ms := func(n int) int64 { return t0 + int64(n)*int64(time.Millisecond) }
+	awake := func() int64 { _, a := h.heardAt(); return a }
 	for _, n := range []int{20, 40, 60, 80, 100} { // pings 20 ms apart: awake, not waking
 		h.heard(ms(n))
 	}
-	if h.awakeSince.Load() != t0 {
+	if awake() != t0 {
 		t.Fatal("ordinary inter-ping gaps moved the wake stamp")
 	}
 	h.heard(ms(100 + 149)) // a gap just short of groupSleepGap (150 ms): not a sleep
-	if h.awakeSince.Load() != t0 {
+	if awake() != t0 {
 		t.Fatal("a gap short of groupSleepGap counted as a sleep")
 	}
 	h.heard(ms(249 + 150)) // exactly the gap: a sleep ended
-	if h.awakeSince.Load() != ms(399) {
+	if awake() != ms(399) {
 		t.Fatal("the inbound that ended a sleep did not move the wake stamp")
 	}
 	// The wake's burst: forty members stamp at once after a long silence.
@@ -284,11 +284,67 @@ func TestTheGroupWakesOnTheInboundThatEndsItsSleep(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
-	if got := h.awakeSince.Load(); got < ms(2000) || got > ms(2039) {
+	last, got := h.heardAt()
+	if got < ms(2000) || got > ms(2039) {
 		t.Fatalf("after the burst the wake stamp is %d ms off the burst", (got-ms(2000))/int64(time.Millisecond))
 	}
-	if got := h.lastInbound.Load(); got < ms(2000) || got > ms(2039) {
-		t.Fatal("the group's last inbound is not the burst's")
+	if last != ms(2039) {
+		t.Fatal("the group's last inbound is not the burst's latest — a member's older clock moved it backwards")
+	}
+}
+
+// THE REVIEW OF b6e89b5: the two stamps must be published and read as ONE
+// state. With two separate atomics a tick between the swap of lastInbound and
+// the store of awakeSince saw a fresh neighbour beside the old wake, and the
+// late member of the burst was a zombie again. A writer alternates bursts of
+// pings with sleeps; a reader loads the pair as fast as it can and must never
+// see a wake inbound as the last inbound without the wake stamp on it. (The
+// hit rate against the two-atomics heard was measured before this test was
+// trusted: every run of the loop below caught it — see the commit.)
+func TestTheWakeIsNeverReadApartFromTheInboundThatMadeIt(t *testing.T) {
+	h := &downlinkHub{}
+	gap := int64(groupSleepGap)
+	// A wake inbound is a multiple of 1000 (a ping never is): the reader can
+	// tell which kind of inbound the last one was without knowing the history.
+	h.clock.Store(&groupClock{lastInbound: 1000, awakeSince: 1000})
+	stop := make(chan struct{})
+	var torn atomic.Int64
+	var reads atomic.Int64
+	var wg sync.WaitGroup
+	for r := 0; r < 2; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				last, awake := h.heardAt()
+				reads.Add(1)
+				if last%1000 == 0 && awake != last {
+					torn.Add(1)
+				}
+			}
+		}()
+	}
+	if gap%1000 != 0 {
+		t.Fatalf("fixture: groupSleepGap %d ns is not on the 1000-grid", gap)
+	}
+	now := int64(1000)
+	for i := 0; i < 200000; i++ {
+		now += gap + 1000 // a sleep ends: this inbound is a wake, on the grid
+		h.heard(now)
+		h.heard(now + 1) // a ping right behind it, off the grid
+	}
+	close(stop)
+	wg.Wait()
+	if reads.Load() == 0 {
+		t.Fatal("fixture: the readers read nothing")
+	}
+	if n := torn.Load(); n != 0 {
+		t.Fatalf("%d of %d reads saw a wake inbound without its wake stamp — the pair is published in two steps", n, reads.Load())
 	}
 }
 
@@ -501,6 +557,12 @@ func TestTheClockworksRules(t *testing.T) {
 		})
 		run(t, mk(), []step{
 			{"no sleep on record (a zero awake stamp): the rule as before", grouped(91, 0, 60, true), false, reapZombie},
+		})
+		// ⚖️ A kept policy, stated: the grace is the zombie rule's alone. The
+		// backstop counts a member's own silence — a wake at its 140th second
+		// does not buy it 45 more.
+		run(t, mk(), []step{
+			{"the group woke 11 s ago, at the 140th second of this member's silence; at 151 s → the backstop, the grace notwithstanding", woke(151, 0, 150, 140), false, reapIdle},
 		})
 		cw := mk()
 		cw.awakeFor = 0

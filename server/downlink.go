@@ -184,27 +184,54 @@ type downlinkHub struct {
 	// Always allocated so the routing code needs no nil check on a hot path.
 	smallCh chan dlPacket
 	reseq   *resequencer // nil unless -uplink-reseq is set
-	// lastInbound is when ANY member of this group was last heard from — stamped
-	// by every member's inbound pump beside its own (heard) — awakeSince is
-	// when the group last WOKE (the inbound that ended a gap of groupSleepGap or
-	// more — a sleep), and superseded is set when the client says it has left
-	// this group (keepalive.go). The three are what lets the reaper tell a
-	// zombie from a sleeping client, from a member a second behind the wake's
-	// burst, and from a switch.
-	lastInbound atomic.Int64
-	awakeSince  atomic.Int64
-	superseded  atomic.Bool
+	// clock is the group's inbound clock as ONE value (groupClock): when ANY
+	// member was last heard from — stamped by every member's inbound pump beside
+	// its own (heard) — and when the group last WOKE (the inbound that ended a
+	// gap of groupSleepGap or more — a sleep). Published whole, never as two
+	// stamps: a reader that could see a fresh neighbour beside a stale wake
+	// would find a member a second behind the wake's burst a zombie — the very
+	// case the wake stamp exists for (the review of b6e89b5). superseded is set
+	// when the client says it has left this group (keepalive.go). The three are
+	// what lets the reaper tell a zombie from a sleeping client, from a late
+	// member of the wake's burst, and from a switch.
+	clock      atomic.Pointer[groupClock]
+	superseded atomic.Bool
+}
+
+// groupClock is the group's inbound clock: both stamps in one immutable value,
+// so that a reader always sees the pair one heard() published together.
+type groupClock struct {
+	lastInbound int64 // when any member was last heard from
+	awakeSince  int64 // when the group last woke: the inbound that ended a sleep
 }
 
 // heard stamps an inbound from any member of the group — and, when it ends a
 // silence of the WHOLE group of groupSleepGap or more (a sleep: well above the
-// client's ping interval), the moment the group woke. One atomic swap decides which inbound ended the gap, so a
-// burst of forty pumps stamping at once moves awakeSince exactly once.
+// client's ping interval), the moment the group woke. The pair is replaced by
+// ONE compare-and-swap of an immutable value: a burst of forty pumps stamping
+// at once moves the wake exactly once (the first swap after the gap), the
+// others find the fresh stamp and keep it — and no reader can see the new
+// last-inbound with the old wake, because the two never exist apart.
 func (h *downlinkHub) heard(nowNs int64) {
-	prev := h.lastInbound.Swap(nowNs)
-	if nowNs-prev >= int64(groupSleepGap) {
-		h.awakeSince.Store(nowNs)
+	for {
+		old := h.clock.Load()
+		next := &groupClock{lastInbound: nowNs, awakeSince: old.awakeSince}
+		if nowNs < old.lastInbound {
+			next.lastInbound = old.lastInbound // two members' clocks a microsecond apart: never backwards
+		}
+		if nowNs-old.lastInbound >= int64(groupSleepGap) {
+			next.awakeSince = nowNs
+		}
+		if h.clock.CompareAndSwap(old, next) {
+			return
+		}
 	}
+}
+
+// heardAt reads the pair as it was published together — one load, never two.
+func (h *downlinkHub) heardAt() (lastInbound, awakeSince int64) {
+	c := h.clock.Load()
+	return c.lastInbound, c.awakeSince
 }
 
 // label identifies the GROUP in this hub's log lines. Every group dials the same
@@ -253,8 +280,7 @@ func newDownlinkHub(ctx context.Context, connect, label string) (*downlinkHub, e
 		smallCh: make(chan dlPacket, dlQueueSize),
 	}
 	now := time.Now().UnixNano()
-	h.lastInbound.Store(now)
-	h.awakeSince.Store(now)
+	h.clock.Store(&groupClock{lastInbound: now, awakeSince: now})
 	// The resequencer belongs to the GROUP, because a group is exactly the set
 	// of connections that merge — and merging unequal-latency paths is what
 	// shuffles the uplink. A connection on its own private socket has nothing to

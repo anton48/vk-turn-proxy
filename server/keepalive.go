@@ -61,7 +61,12 @@ import (
 //     the time every healthy member needs to have spoken. The margin between
 //     reapZombieAfter and zombieNeighbourWithin is the ping interval, which is
 //     what keeps a member from looking like a zombie while the whole group
-//     sleeps;
+//     sleeps. The two stamps are ONE value (groupClock), written and read
+//     whole: a reader that saw the fresh neighbour beside the old wake would
+//     reap the late member all the same. ⚖️ The grace is the ZOMBIE rule's
+//     alone: the backstop counts a member's own silence and takes it at 150 s
+//     whatever its group did a moment ago — a wake at the 140th second of a
+//     member's silence does not buy it 45 more (a kept policy, stated);
 //   - a group the client has SUPERSEDED (it says so with a sentinel on the
 //     connections of its new group after a network switch — see
 //     isGroupSupersede) goes at the next tick, so no repeat is ever sent into
@@ -309,11 +314,14 @@ func runClockwork(ctx context.Context, conn net.Conn, st *connStat, lastInbound 
 				haveEcho:    echo.get() != nil,
 			}
 			if h != nil {
-				if ns := h.lastInbound.Load(); ns != 0 {
-					in.groupLastInbound = time.Unix(0, ns)
+				// The pair from ONE load: a fresh neighbour is never read beside a
+				// stale wake (the review of b6e89b5).
+				last, awake := h.heardAt()
+				if last != 0 {
+					in.groupLastInbound = time.Unix(0, last)
 				}
-				if ns := h.awakeSince.Load(); ns != 0 {
-					in.groupAwakeSince = time.Unix(0, ns)
+				if awake != 0 {
+					in.groupAwakeSince = time.Unix(0, awake)
 				}
 				in.superseded = h.superseded.Load()
 			}
