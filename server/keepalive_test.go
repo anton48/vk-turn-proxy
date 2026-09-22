@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -317,6 +318,9 @@ func TestTheClockworksRules(t *testing.T) {
 			if repeat != s.wantRepeat || reap != s.wantReap {
 				t.Fatalf("%s: got repeat=%v reap=%s, want repeat=%v reap=%s", s.name, repeat, reap, s.wantRepeat, s.wantReap)
 			}
+			if repeat {
+				cw.repeated(s.in.now) // the caller stamps what it WROTE
+			}
 		}
 	}
 	grouped := func(now, last, group float64, echo bool) clockworkInput {
@@ -341,6 +345,16 @@ func TestTheClockworksRules(t *testing.T) {
 			{"heard at 50 s; at 80 s the silence is 30 s", grouped(80, 50, 50, true), false, reapNone},
 			{"at 95 s the silence is 45 s again, 50 s since the repeat", grouped(95, 50, 50, true), false, reapNone},
 			{"at 110 s: 60 s since the repeat", grouped(110, 50, 50, true), true, reapNone},
+		})
+	})
+	t.Run("a repeat the gate held back is not stamped: the next silence's first repeat is not delayed", func(t *testing.T) {
+		cw := mk()
+		if repeat, _ := cw.step(grouped(45, 0, 0, true)); !repeat {
+			t.Fatal("fixture: no repeat decided at 45 s")
+		}
+		// Not stamped: the client spoke and the gate wrote nothing.
+		run(t, cw, []step{
+			{"heard at 46 s; at 91 s the silence is 45 s again → a repeat, not 60 s after the held one", grouped(91, 46, 46, true), true, reapNone},
 		})
 	})
 	t.Run("the repeats are off at every 0", func(t *testing.T) {
@@ -430,16 +444,150 @@ func TestAConnectionSurvivesItsOwnPromotion(t *testing.T) {
 	}
 	defer wgSide.Close()
 	target := wgSide.LocalAddr().String()
-	for round := 0; round < 200; round++ {
+	// Batches of concurrent pumps: the window is a few microseconds wide and
+	// contention is what opens it — 200 sequential rounds caught the restored
+	// race three times in four.
+	const batches, perBatch = 20, 100
+	for b := 0; b < batches; b++ {
 		ctx, cancel := context.WithCancel(context.Background())
-		c := newScriptedConn(hello(0x7a), probe(1))
-		done := make(chan struct{})
-		go func() { defer close(done); pumpBidirectional(ctx, c, target, false) }()
-		if ended(done, 30*time.Millisecond) {
-			t.Fatalf("round %d: the connection ended at its promotion", round)
+		conns := make([]*scriptedConn, perBatch)
+		dones := make([]chan struct{}, perBatch)
+		for i := range conns {
+			conns[i] = newScriptedConn(hello(0x7a), probe(1))
+			dones[i] = make(chan struct{})
+			go func(c *scriptedConn, done chan struct{}) {
+				defer close(done)
+				pumpBidirectional(ctx, c, target, false)
+			}(conns[i], dones[i])
+		}
+		time.Sleep(30 * time.Millisecond)
+		for i, done := range dones {
+			if ended(done, 0) {
+				t.Fatalf("batch %d, connection %d: ended at its promotion", b, i)
+			}
 		}
 		cancel()
-		c.Close()
-		<-done
+		for i := range conns {
+			conns[i].Close()
+			<-dones[i]
+		}
 	}
+}
+
+// The gate alone: before any echo it writes nothing at all — not even an empty
+// packet — and a repeat the gate held back leaves the clockwork's stamp alone,
+// while one it wrote is stamped.
+func TestTheGateWritesNothingBeforeAnEchoAndStampsOnlyWhatItWrote(t *testing.T) {
+	conn := &fakeConn{}
+	var echo lastEcho
+	var lastInbound atomic.Int64
+	lastInbound.Store(time.Now().Add(-time.Minute).UnixNano())
+	cw := &clockwork{after: 200 * time.Millisecond, every: 150 * time.Millisecond}
+	if sent, err := cw.send(conn, &lastInbound, &echo, time.Now()); err != nil || sent {
+		t.Fatalf("before any echo: sent=%v err=%v", sent, err)
+	}
+	if n := conn.count(); n != 0 {
+		t.Fatalf("before any echo %d packet(s) were written", n)
+	}
+	if err := echo.echo(conn, probe(3)); err != nil {
+		t.Fatal(err)
+	}
+	lastInbound.Store(time.Now().UnixNano()) // the client has just spoken
+	if sent, _ := cw.send(conn, &lastInbound, &echo, time.Now()); sent || !cw.lastRepeat.IsZero() {
+		t.Fatalf("a repeat held back by the gate: sent=%v, stamped=%v", sent, !cw.lastRepeat.IsZero())
+	}
+	lastInbound.Store(time.Now().Add(-time.Minute).UnixNano())
+	now := time.Now()
+	if sent, _ := cw.send(conn, &lastInbound, &echo, now); !sent || !cw.lastRepeat.Equal(now) {
+		t.Fatalf("a repeat written: sent=%v, stamped at the write=%v", sent, cw.lastRepeat.Equal(now))
+	}
+	if n := conn.count(); n != 2 {
+		t.Fatalf("the wire carries %d packet(s), want the echo and one repeat", n)
+	}
+}
+
+// THE REVIEW'S INTERLEAVING (2026-09-22). The clockwork decided to repeat seq 1;
+// before its write, the inbound pump read a fresh ping seq 2 and echoed it;
+// then the prepared repeat of seq 1 went out — and a client from before build
+// 422, whose pong handler stores the seq unconditionally, moved its mark back
+// and missed the answer its probe had earned. The repeat now re-reads the
+// silence under the echo's own lock right before it writes: a client that has
+// spoken since the tick decided gets no repeat, and a repeat is never written
+// behind a fresher echo.
+func TestARepeatNeverFollowsAFresherEcho(t *testing.T) {
+	t.Run("the client spoke between the decision and the write: nothing is written", func(t *testing.T) {
+		conn := &fakeConn{}
+		var echo lastEcho
+		var lastInbound atomic.Int64
+		lastInbound.Store(time.Now().Add(-time.Minute).UnixNano())
+		if err := echo.echo(conn, probe(1)); err != nil {
+			t.Fatal(err)
+		}
+		cw := &clockwork{after: 200 * time.Millisecond, every: 150 * time.Millisecond, zombie: time.Hour, neighbour: time.Hour, idle: time.Hour}
+		in := clockworkInput{now: time.Now(), lastInbound: time.Unix(0, lastInbound.Load()), haveEcho: true}
+		if repeat, _ := cw.step(in); !repeat {
+			t.Fatal("fixture: the tick did not decide to repeat")
+		}
+		// The inbound pump, between the decision and the write: a fresh ping.
+		lastInbound.Store(time.Now().UnixNano())
+		if err := echo.echo(conn, probe(2)); err != nil {
+			t.Fatal(err)
+		}
+		sent, err := echo.repeat(conn, &lastInbound, cw.after)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sent {
+			t.Fatal("a repeat was written behind a fresher echo")
+		}
+		conn.mu.Lock()
+		defer conn.mu.Unlock()
+		if len(conn.got) != 2 || string(conn.got[1]) != string(probe(2)) {
+			t.Fatalf("the wire carries %d packet(s), want the two echoes only", len(conn.got))
+		}
+	})
+	t.Run("under contention the seq on the wire never goes backwards", func(t *testing.T) {
+		conn := &fakeConn{}
+		var echo lastEcho
+		var lastInbound atomic.Int64
+		lastInbound.Store(time.Now().Add(-time.Minute).UnixNano())
+		if err := echo.echo(conn, probe(1)); err != nil {
+			t.Fatal(err)
+		}
+		const pings = 400
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for seq := uint64(2); seq <= pings; seq++ {
+				// The inbound pump: the read stamps, then the echo.
+				lastInbound.Store(time.Now().UnixNano())
+				_ = echo.echo(conn, probe(seq))
+				if seq%7 == 0 {
+					// Now and then a silence long enough for a repeat to be due.
+					lastInbound.Store(time.Now().Add(-time.Minute).UnixNano())
+				}
+			}
+		}()
+		for i := 0; i < 4000; i++ {
+			_, _ = echo.repeat(conn, &lastInbound, 100*time.Millisecond)
+		}
+		<-done
+		conn.mu.Lock()
+		defer conn.mu.Unlock()
+		var last uint64
+		repeats := 0
+		for i, pkt := range conn.got {
+			seq := binary.BigEndian.Uint64(pkt[4:])
+			if seq < last {
+				t.Fatalf("write %d carries seq %d behind seq %d — a repeat landed after a fresher echo", i, seq, last)
+			}
+			if seq == last {
+				repeats++
+			}
+			last = seq
+		}
+		if repeats == 0 {
+			t.Fatal("fixture: not one repeat was written — the test exercised nothing")
+		}
+	})
 }

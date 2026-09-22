@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -100,16 +101,55 @@ func isGroupSupersede(buf []byte) (groupKey, bool) {
 }
 
 // lastEcho keeps the bytes of the last probe this connection echoed — the only
-// thing the keepalive is allowed to send. Written by the inbound pump, read by
-// the clockwork; a fresh copy per set, so a reader never sees a buffer being
-// reused for the next read.
+// thing the keepalive is allowed to send — and ORDERS the echoes and the
+// repeats on the wire. The order is load-bearing for a client that predates
+// build 422: its pong handler stores the seq it sees unconditionally, so a
+// repeat of seq 1 landing AFTER the fresh echo of seq 2 moves its mark back
+// and its probe misses the answer it had earned. The inbound pump's read stamps
+// lastInbound BEFORE its echo takes this lock; the repeat re-reads that stamp
+// under the same lock right before it writes and sends nothing if the client
+// has spoken since the tick decided. So a repeat is always written BEFORE any
+// echo of a later ping, never behind it. A fresh copy per set, so a reader
+// never sees a buffer being reused for the next read.
 type lastEcho struct {
-	p atomic.Pointer[[]byte]
+	mu sync.Mutex // held across every echo write and every repeat's check-and-write
+	p  atomic.Pointer[[]byte]
 }
 
-func (e *lastEcho) set(b []byte) {
-	cp := append([]byte(nil), b...)
+// echo writes a probe back to the client and keeps it as the last echo. The
+// caller has stamped lastInbound for this very read already.
+func (e *lastEcho) echo(conn net.Conn, pkt []byte) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Write(pkt); err != nil {
+		return err
+	}
+	cp := append([]byte(nil), pkt...)
 	e.p.Store(&cp)
+	return nil
+}
+
+// repeat writes the last echo again — unless the client has spoken since the
+// clockwork decided to (a read newer than `after` ago), in which case nothing
+// is written: the fresh echo that read earned goes out instead, and a repeat
+// behind it would have been the stale seq the old clients cannot take.
+// Returns whether a repeat was written.
+func (e *lastEcho) repeat(conn net.Conn, lastInbound *atomic.Int64, after time.Duration) (bool, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if time.Since(time.Unix(0, lastInbound.Load())) < after {
+		return false, nil
+	}
+	b := e.get()
+	if b == nil {
+		return false, nil
+	}
+	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Write(b); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // get returns nil until a probe has been echoed.
@@ -191,8 +231,24 @@ func (c *clockwork) step(in clockworkInput) (repeat bool, reap reapReason) {
 	if !c.lastRepeat.IsZero() && in.now.Sub(c.lastRepeat) < c.every {
 		return false, reapNone
 	}
-	c.lastRepeat = in.now
 	return true, reapNone
+}
+
+// repeated stamps the repeat that was WRITTEN — one the gate held back (the
+// client spoke meanwhile) leaves the stamp alone, so the next silence gets
+// its first repeat at keepaliveAfter and not a full interval later.
+func (c *clockwork) repeated(now time.Time) { c.lastRepeat = now }
+
+// send carries out a repeat the tick decided: the write goes through the
+// echo's gate — which holds it back if the client has spoken since — and only
+// a repeat that was WRITTEN is stamped. Returns whether one was written.
+func (c *clockwork) send(conn net.Conn, lastInbound *atomic.Int64, echo *lastEcho, now time.Time) (bool, error) {
+	sent, err := echo.repeat(conn, lastInbound, c.after)
+	if err != nil || !sent {
+		return false, err
+	}
+	c.repeated(now)
+	return true, nil
 }
 
 // The reaper's counters, by reason, and the keepalive's — read by the
@@ -253,13 +309,17 @@ func runClockwork(ctx context.Context, conn net.Conn, st *connStat, lastInbound 
 			if !repeat {
 				continue
 			}
-			// The bytes the client has already accepted once, and nothing else.
-			_ = conn.SetWriteDeadline(now.Add(5 * time.Second))
-			if _, err := conn.Write(echo.get()); err != nil {
+			// The bytes the client has already accepted once, and nothing else —
+			// and only if the client is still silent at the moment of the write.
+			sent, err := cw.send(conn, lastInbound, echo, now)
+			if err != nil {
 				keepaliveWriteFails.Add(1)
 				log.Printf("conn %d: keepalive write failed: %s", st.id, err)
 				cancel()
 				return
+			}
+			if !sent {
+				continue
 			}
 			st.keepalives.Add(1)
 			keepaliveRepeats.Add(1)

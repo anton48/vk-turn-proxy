@@ -660,14 +660,13 @@ func pumpBidirectional(ctx context.Context, conn net.Conn, connect string, singl
 			// echo the same packets, and the same client-side
 			// recognizer (isProbePacket) handles either response.
 			if n >= 4 && buf[0] == 0xff && buf[1] == 'P' && buf[2] == 'N' && buf[3] == 'G' {
-				_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-				if _, err1 = conn.Write(buf[:n]); err1 != nil {
+				// Written and kept under the echo's lock: what was just echoed is
+				// what may be repeated into this connection's next silence, byte
+				// for byte, and never behind a fresher echo (keepalive.go).
+				if err1 = echo.echo(conn, buf[:n]); err1 != nil {
 					log.Printf("probe-echo write failed: %s", err1)
 					return
 				}
-				// Kept for the keepalive: what was just echoed is what may be
-				// repeated into this connection's next silence, byte for byte.
-				echo.set(buf[:n])
 				continue
 			}
 			// Measured HERE, at the merge point, because this is where the
