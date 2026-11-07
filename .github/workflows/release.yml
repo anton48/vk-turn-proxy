@@ -115,6 +115,18 @@ jobs:
             -o "dist/server-${GOOS}-${GOARCH}${EXT}" \
             ./server
 
+          # tools/turn-relay — the user's own TURN relay for the client's
+          # override list (issue #105; moved here from the iOS repo on
+          # 2026-11-07). A module of its own on the vendored pion/turn fork
+          # (third_party/pion-turn), built for every row but Windows and
+          # Android: it is a Unix daemon (signals, SO_REUSEPORT in its tests).
+          if [ "$GOOS" != "windows" ] && [ "$GOOS" != "android" ]; then
+            (cd tools/turn-relay && \
+              GOOS=$GOOS GOARCH=$GOARCH GOARM=$GOARM \
+              go build -ldflags "-s -w -checklinkname=0" -trimpath \
+                -o "../../dist/turn-relay-${GOOS}-${GOARCH}" .)
+          fi
+
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:

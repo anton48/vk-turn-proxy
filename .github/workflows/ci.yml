@@ -52,6 +52,14 @@ jobs:
       - name: Run tests
         run: |
           go test ./... -v
+
+      # tools/turn-relay and its vendored pion/turn fork are modules of their
+      # own, never reached by the root ./... (tools/test.sh runs the same).
+      - name: Test the relay fork's guard and the relay tool
+        run: |
+          go mod download github.com/pion/turn/v5@v5.0.2
+          (cd third_party/pion-turn && go test -count=1 -skip 'TestConnectRequest|TestServerVNet/AuthEventHandlerFailure' . ./internal/server/)
+          (cd tools/turn-relay && go test -count=1 . && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test -c -o /dev/null .)
           
   build:
     name: Build binaries
