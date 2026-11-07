@@ -57,6 +57,8 @@ type connStat struct {
 	// 0 while it lives).
 	keepalives atomic.Int64
 	reaped     atomic.Int64
+	// The client's pace declaration for this connection (pacedecl.go).
+	paceDeclState
 }
 
 type connRegistry struct {
@@ -131,8 +133,11 @@ func (r *connRegistry) dump(dur time.Duration, label string) {
 	}
 	r.mu.Lock()
 	rows := make([]statRow, 0, len(r.conns))
-	var pacedPkts, dnPkts, paceNs int64
+	var pacedPkts, dnPkts, paceNs, declared int64
 	for id, c := range r.conns {
+		if _, ok := c.declaredPace(); ok {
+			declared++
+		}
 		u, d := c.up.Load(), c.down.Load()
 		rows = append(rows, statRow{
 			id: id, remote: c.remote,
@@ -196,7 +201,7 @@ func (r *connRegistry) dump(dur time.Duration, label string) {
 	// Only when pacing is on, and worth reading closely: 0 delayed writes means
 	// the rate is set above what the traffic ever asks for, so the pacer is
 	// present but inert and the run is NOT a test of it.
-	if downlinkPaceRate > 0 {
+	if downlinkPaceRate > 0 || declared > 0 {
 		pct := 0.0
 		if dnPkts > 0 {
 			pct = 100 * float64(pacedPkts) / float64(dnPkts)
@@ -205,10 +210,12 @@ func (r *connRegistry) dump(dur time.Duration, label string) {
 		if pacedPkts > 0 {
 			mean = time.Duration(paceNs / pacedPkts)
 		}
-		log.Printf("  pacer: %d/%d writes delayed (%.1f%%), Σwait %s, mean wait %s",
+		// `declared`: connections pacing at their client's word (pacedecl.go)
+		// rather than the flag's rate — the own-relay connections, normally.
+		log.Printf("  pacer: %d/%d writes delayed (%.1f%%), Σwait %s, mean wait %s | declared pace on %d conn(s)",
 			pacedPkts, dnPkts, pct,
 			time.Duration(paceNs).Round(time.Millisecond),
-			mean.Round(10*time.Microsecond))
+			mean.Round(10*time.Microsecond), declared)
 	}
 
 	// The keepalive and the reaper, since the start: the repeats say the silences

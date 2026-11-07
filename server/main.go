@@ -82,6 +82,19 @@ func main() {
 			"247 delivery is 100.00% and at 260 it is 97.96% with 9.4% less "+
 			"throughput. Read the 'pacer:' line in conn-stats — 0 delayed "+
 			"writes means the rate is too high to be shaping anything.")
+	paceMax := flag.Float64("downlink-pace-max", 0,
+		"the highest downlink pace a client may DECLARE for a connection, in "+
+			"KiB/s of counted bytes (the same unit as -downlink-pace). A client "+
+			"whose TURN override list gives a relay a pace (host:port:quota:pace) "+
+			"declares it behind the hello of every connection on that relay, and "+
+			"that connection is paced at its word instead of -downlink-pace — the "+
+			"user's own relay has no per-allocation policer, and there the pacer "+
+			"costs ~40 %% of the download for nothing. 0 (the default) honours a "+
+			"declaration as made, a declared 'no pacer' included; N bounds it: a "+
+			"declared rate above N, or 'no pacer', runs at N. A wrong declaration "+
+			"costs the declaring connection alone (a VK relay declared unpaced "+
+			"loses ~10 %% to VK's policer), so this is an operator's bound, not a "+
+			"defence.")
 	paceBurst := flag.Float64("downlink-pace-burst", 16,
 		"bucket capacity for -downlink-pace, in KiB of counted bytes. This is "+
 			"how much overshoot survives the pacer, so it is the whole point: "+
@@ -235,6 +248,10 @@ func main() {
 	// connection while its packets queued in its own private socket; nothing
 	// would move to the idle connections and the result would be added latency
 	// rather than shaping.
+	if *paceMax > 0 {
+		downlinkPaceMax = *paceMax * 1024
+		log.Printf("downlink pacing: a client's declared pace is bounded at %.0f KiB/s (-downlink-pace-max)", *paceMax)
+	}
 	if *paceRate > 0 {
 		downlinkPaceRate = *paceRate * 1024
 		downlinkPaceBurst = *paceBurst * 1024
@@ -652,6 +669,17 @@ func pumpBidirectional(ctx context.Context, conn net.Conn, connect string, singl
 			// no-op — never a reason to touch this connection.
 			if old, ok := isGroupSupersede(buf[:n]); ok {
 				groups.supersede(old, bind.Load().key)
+				continue
+			}
+			// Pace declaration (pacedecl.go): the client names the pace of
+			// this connection's relay — its downlink runs at that rate in
+			// place of -downlink-pace, under -downlink-pace-max. Consumed,
+			// never forwarded; the writer picks it up at its next reservation.
+			if kib, ok := isGroupPace(buf[:n]); ok {
+				if st.declarePace(kib) {
+					rate, _, _ := st.paceRate()
+					log.Printf("conn %d declares its relay's pace: %s — the downlink runs %s", st.id, describePaceKiB(kib), describePaceRate(rate))
+				}
 				continue
 			}
 			// Probe-echo: the iOS client sends a 12-byte sentinel

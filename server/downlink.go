@@ -345,15 +345,31 @@ func (h *downlinkHub) readLoop(ctx context.Context) {
 // token bucket (see pacer.go), so the connection emits at the rate VK will
 // actually carry rather than as fast as the WireGuard socket produces.
 func (h *downlinkHub) serveConn(ctx context.Context, conn net.Conn, st *connStat) {
+	// The rate is the connection's (pacedecl.go): the client's declaration
+	// under the cap, else the flag's. Read before every reservation by its
+	// generation — one atomic load — so a declaration that lands while this
+	// writer runs (it arrives right behind the hello that started it, a
+	// moment after the promotion) rebuilds the bucket instead of being read
+	// once at the start and missed.
 	var pc *pacer
-	if downlinkPaceRate > 0 {
-		pc = newPacer(downlinkPaceRate, downlinkPaceBurst)
+	var paceSeen uint64
+	rebuild := func() {
+		rate, burst, gen := st.paceRate()
+		paceSeen = gen
+		pc = nil
+		if rate > 0 {
+			pc = newPacer(rate, burst)
+		}
 	}
+	rebuild()
 	serveSmall := claimSmallSlot()
 	if serveSmall {
 		defer dlSmallWriters.Add(-1)
 	}
 	for {
+		if st.paceGen.Load() != paceSeen {
+			rebuild()
+		}
 		// Reserve BEFORE dequeuing — see the warning on pacer.await. A writer
 		// waiting on tokens must not be holding a packet that a connection with
 		// tokens could have sent.
