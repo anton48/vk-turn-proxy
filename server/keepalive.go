@@ -193,6 +193,7 @@ const (
 	reapIdle                  // silent for groupIdleTimeout — the backstop, as before
 	reapZombie                // silent beside a neighbour the group heard from
 	reapSuperseded            // the client said it left this group
+	reapReplaced              // the client's new connection named this one as the one it replaces (repdecl.go)
 )
 
 func (r reapReason) String() string {
@@ -203,6 +204,8 @@ func (r reapReason) String() string {
 		return "zombie"
 	case reapSuperseded:
 		return "superseded"
+	case reapReplaced:
+		return "replaced"
 	}
 	return "none"
 }
@@ -289,16 +292,19 @@ func (c *clockwork) send(conn net.Conn, lastInbound *atomic.Int64, echo *lastEch
 var (
 	keepaliveRepeats    atomic.Int64
 	keepaliveWriteFails atomic.Int64
-	reapsByReason       [4]atomic.Int64 // indexed by reapReason
+	reapsByReason       [5]atomic.Int64 // indexed by reapReason
 )
 
 // runClockwork is the goroutine that ticks a connection's clockwork every
 // groupReapEvery: it repeats the last echo into a silence and it reaps by the
 // rules above. `cancel` ends the connection; `hubOf` reads the current binding
 // (a connection is promoted into its group while this runs).
-func runClockwork(ctx context.Context, conn net.Conn, st *connStat, lastInbound *atomic.Int64,
+// The clockwork is built by the CALLER, in its own goroutine, before this one
+// starts: the knobs are plain globals, and a goroutine that read them at its
+// own start could still be starting when the function that spawned it had
+// long returned (a test setting the knobs behind a finished pump raced it).
+func runClockwork(ctx context.Context, cw *clockwork, conn net.Conn, st *connStat, lastInbound *atomic.Int64,
 	echo *lastEcho, hubOf func() *downlinkHub, cancel context.CancelFunc) {
-	cw := newClockwork()
 	t := time.NewTicker(groupReapEvery)
 	defer t.Stop()
 	for {

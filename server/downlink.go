@@ -178,8 +178,12 @@ type dlPacket struct {
 }
 
 type downlinkHub struct {
-	wg net.Conn
-	ch chan dlPacket
+	// The members holding the client's connection indices (repdecl.go): a new
+	// session naming its index ends the member that held it.
+	membersMu sync.Mutex
+	members   map[uint16]hubMember
+	wg        net.Conn
+	ch        chan dlPacket
 	// smallCh carries the ACK-sized packets when -downlink-small-conns is set.
 	// Always allocated so the routing code needs no nil check on a hot path.
 	smallCh chan dlPacket

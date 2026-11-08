@@ -550,6 +550,11 @@ func pumpBidirectional(ctx context.Context, conn net.Conn, connect string, singl
 		bind   atomic.Pointer[binding]
 		joined atomic.Bool
 	)
+	defer func() { // the index this connection held in its group is free again (repdecl.go)
+		if b := bind.Load(); b != nil && b.hub != nil {
+			b.hub.leave(st)
+		}
+	}()
 	held := legacyGroupKey
 	haveGroup := false
 	if singleClient {
@@ -682,6 +687,19 @@ func pumpBidirectional(ctx context.Context, conn net.Conn, connect string, singl
 				}
 				continue
 			}
+			// Replacement (repdecl.go): the client names the index of the
+			// connection this one replaces — the member holding it ends at
+			// once instead of stealing from the group's queue until the
+			// zombie reaper. Consumed, never forwarded; ignored before the
+			// hello (the next tick's repeat claims).
+			if idx, ok := isGroupReplace(buf[:n]); ok {
+				if b := bind.Load(); b.hub != nil && joined.Load() {
+					if prev := b.hub.claim(idx, st, cancel2); prev != nil {
+						log.Printf("conn %d: the client names it the successor of its connection %d — conn %d, the predecessor, ends and leaves the group's queue", st.id, idx, prev.id)
+					}
+				}
+				continue
+			}
 			// Probe-echo: the iOS client sends a 12-byte sentinel
 			// (0xff 'P' 'N' 'G' + 8-byte BE seq) on each conn at
 			// probeInterval to detect zombie conns. Echo it back
@@ -783,7 +801,7 @@ func pumpBidirectional(ctx context.Context, conn net.Conn, connect string, singl
 	// keeps stealing from the shared queue and dropping what it steals — with
 	// the two rules the keepalive made possible: a zombie beside heard
 	// neighbours, and a group the client says it has left.
-	go runClockwork(ctx2, conn, st, &lastInbound, &echo,
+	go runClockwork(ctx2, newClockwork(), conn, st, &lastInbound, &echo,
 		func() *downlinkHub { return bind.Load().hub }, cancel2)
 	wg.Wait()
 	log.Printf("Connection closed: %s\n", conn.RemoteAddr())

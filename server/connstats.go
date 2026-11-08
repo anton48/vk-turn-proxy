@@ -221,9 +221,9 @@ func (r *connRegistry) dump(dur time.Duration, label string) {
 	// The keepalive and the reaper, since the start: the repeats say the silences
 	// were seen, the reasons say what ended the connections that ended — the
 	// numbers to set beside a client log's kills and re-dials.
-	log.Printf("  keepalive: %d repeat(s) sent, %d write(s) failed; reaped: %d idle, %d zombie, %d superseded (since start)",
+	log.Printf("  keepalive: %d repeat(s) sent, %d write(s) failed; reaped: %d idle, %d zombie, %d superseded, %d replaced (since start)",
 		keepaliveRepeats.Load(), keepaliveWriteFails.Load(),
-		reapsByReason[reapIdle].Load(), reapsByReason[reapZombie].Load(), reapsByReason[reapSuperseded].Load())
+		reapsByReason[reapIdle].Load(), reapsByReason[reapZombie].Load(), reapsByReason[reapSuperseded].Load(), reapsByReason[reapReplaced].Load())
 	// The ACK-path experiment. 🚨 Read `routed` first: ZERO means no packet was
 	// small enough to take the path, so the run did NOT test it — the same trap
 	// as "0 delayed writes" above. `fell back` climbing means the small queue is
