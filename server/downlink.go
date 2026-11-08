@@ -182,6 +182,7 @@ type downlinkHub struct {
 	// session naming its index ends the member that held it.
 	membersMu sync.Mutex
 	members   map[uint16]hubMember
+	maxGen    map[uint16]uint64 // the highest generation accepted per index — kept after its holder leaves
 	wg        net.Conn
 	ch        chan dlPacket
 	// smallCh carries the ACK-sized packets when -downlink-small-conns is set.

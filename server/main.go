@@ -692,9 +692,9 @@ func pumpBidirectional(ctx context.Context, conn net.Conn, connect string, singl
 			// once instead of stealing from the group's queue until the
 			// zombie reaper. Consumed, never forwarded; ignored before the
 			// hello (the next tick's repeat claims).
-			if idx, ok := isGroupReplace(buf[:n]); ok {
+			if idx, gen, ok := isGroupReplace(buf[:n]); ok {
 				if b := bind.Load(); b.hub != nil && joined.Load() {
-					if prev := b.hub.claim(idx, st, cancel2); prev != nil {
+					if prev := b.hub.claim(idx, gen, st, cancel2); prev != nil {
 						log.Printf("conn %d: the client names it the successor of its connection %d — conn %d, the predecessor, ends and leaves the group's queue", st.id, idx, prev.id)
 					}
 				}
