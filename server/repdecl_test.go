@@ -58,6 +58,7 @@ type pumped struct {
 	c    *scriptedConn
 	done chan struct{}
 	st   *connStat
+	from *net.UDPAddr // the hub's socket, where the WireGuard side sends the downlink
 }
 
 func runPumped(t *testing.T, ctx context.Context, wgSide *net.UDPConn, payload byte, pkts ...[]byte) *pumped {
@@ -70,7 +71,7 @@ func runPumped(t *testing.T, ctx context.Context, wgSide *net.UDPConn, payload b
 	t.Cleanup(func() { c.Close(); <-done })
 	_ = wgSide.SetReadDeadline(time.Now().Add(3 * time.Second))
 	buf := make([]byte, 1600)
-	n, _, err := wgSide.ReadFromUDP(buf)
+	n, from, err := wgSide.ReadFromUDP(buf)
 	if err != nil {
 		t.Fatalf("payload %x never reached the WireGuard side: %v", payload, err)
 	}
@@ -86,7 +87,7 @@ func runPumped(t *testing.T, ctx context.Context, wgSide *net.UDPConn, payload b
 	if st == nil {
 		t.Fatal("the connection's connStat not found")
 	}
-	return &pumped{c: c, done: done, st: st}
+	return &pumped{c: c, done: done, st: st, from: from}
 }
 
 // withPatientReaper: the package's tests run the reaper on a sub-second scale
@@ -227,7 +228,7 @@ func runPacedPumped(t *testing.T, ctx context.Context, wgSide *net.UDPConn, payl
 	t.Cleanup(func() { c.Close(); <-done })
 	_ = wgSide.SetReadDeadline(time.Now().Add(5 * time.Second))
 	buf := make([]byte, 1600)
-	n, _, err := wgSide.ReadFromUDP(buf)
+	n, from, err := wgSide.ReadFromUDP(buf)
 	if err != nil || n != len(data) || buf[n-1] != payload {
 		t.Fatalf("payload %x: %v / %d bytes", payload, err, n)
 	}
@@ -237,7 +238,7 @@ func runPacedPumped(t *testing.T, ctx context.Context, wgSide *net.UDPConn, payl
 			st = registry.get(id)
 		}
 	}
-	return &pumped{c: c, done: done, st: st}
+	return &pumped{c: c, done: done, st: st, from: from}
 }
 
 func TestALateSentinelOfTheOldSessionDoesNotEndItsSuccessor(t *testing.T) {
@@ -254,58 +255,110 @@ func TestALateSentinelOfTheOldSessionDoesNotEndItsSuccessor(t *testing.T) {
 	a := runPacedPumped(t, ctx, wgSide, 'a', []time.Duration{0, 0, 700 * time.Millisecond}, hello(0x7e), []byte{4, 0, 0, 0, 'a'}, repDecl(3, 1))
 	// B, the newer session of the same index (generation 2), claims meanwhile.
 	b := runPumped(t, ctx, wgSide, 'b', hello(0x7e), repDecl(3, 2))
-	// A's late sentinel arrives: B stays, nobody ends.
-	time.Sleep(1200 * time.Millisecond)
-	if pumpEnded(b, 100*time.Millisecond) {
-		t.Fatalf("the old session's late sentinel ended its successor (reap reason %d)", b.st.reaped.Load())
+	// A's late sentinel arrives, generation 1 below the bar 2: B stays — and A,
+	// the predecessor that outlived its replacement, ENDS (the user's review of
+	// a316b3c: a bare return from claim left A a member and a consumer of the
+	// group's queue — 10 of the next 20 downlink packets went to it).
+	if pumpEnded(b, 1200*time.Millisecond) {
+		t.Fatal("the successor ended on the old session's late sentinel")
 	}
-	if pumpEnded(a, 100*time.Millisecond) {
-		t.Fatal("the old session ended although it never held the index")
+	if !pumpEnded(a, 3*time.Second) {
+		t.Fatal("the old session's late sentinel ended nobody — A stays a member and takes from the group's queue")
 	}
-	if got := reapsByReason[reapReplaced].Load() - replacedBefore; got != 0 {
-		t.Fatalf("replaced counter moved by %d, want 0", got)
+	if got := reapsByReason[reapReplaced].Load() - replacedBefore; got != 1 {
+		t.Fatalf("the replaced count moved by %d, want 1 — A, the stale sender", got)
+	}
+	if r := reapReason(a.st.reaped.Load()); r != reapReplaced {
+		t.Fatalf("A's reap reason %v, want replaced", r)
+	}
+	// The downlink after it: every packet to B, none to A.
+	aBefore, _ := a.c.writes()
+	bBefore, _ := b.c.writes()
+	for i := 0; i < 20; i++ {
+		if _, err := wgSide.WriteToUDP([]byte{4, 0, 0, 0, byte(i)}, b.from); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		got, _ := b.c.writes()
+		if len(got)-len(bBefore) >= 20 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("B received %d of the 20 downlink packets", len(got)-len(bBefore))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got, _ := a.c.writes(); len(got) != len(aBefore) {
+		t.Fatalf("A, ended, still received %d downlink packet(s)", len(got)-len(aBefore))
 	}
 }
 
 // At the hub: a displaced session's repeat (its generation, read before its end)
 // takes nothing back; after the holder leaves, the highest generation accepted is
-// still the bar; a higher generation from another connection displaces.
+// still the bar; a higher generation from another connection displaces. And (the
+// user's review of a316b3c) a claim STRICTLY OLDER than the bar from a connection
+// that is not the holder ends THAT connection — a predecessor that outlived its
+// replacement would go on taking from the group's queue — while the holder
+// stays; a claim AT the bar from another connection ends nobody.
 func TestADisplacedSessionNeverTakesTheIndexBack(t *testing.T) {
 	h := &downlinkHub{}
-	a, b, c := &connStat{id: 1}, &connStat{id: 2}, &connStat{id: 3}
+	a, b, c, d, e := &connStat{id: 1}, &connStat{id: 2}, &connStat{id: 3}, &connStat{id: 4}, &connStat{id: 5}
 	cancels := map[*connStat]int{}
 	cancelOf := func(st *connStat) func() { return func() { cancels[st]++ } }
-	if prev := h.claim(3, 1, a, cancelOf(a)); prev != nil {
-		t.Fatal("the first claim displaced somebody")
+	replacedBefore := reapsByReason[reapReplaced].Load()
+	if prev, stale := h.claim(3, 1, a, cancelOf(a)); prev != nil || stale {
+		t.Fatalf("A's first claim: prev %v stale %v, want neither", prev, stale)
 	}
-	if prev := h.claim(3, 2, b, cancelOf(b)); prev != a || cancels[a] != 1 {
-		t.Fatalf("the newer generation did not displace the older: prev %v, cancels %v", prev != nil, cancels)
+	if prev, stale := h.claim(3, 2, b, cancelOf(b)); prev != a || stale || cancels[a] != 1 {
+		t.Fatalf("B's claim: prev %v stale %v cancels[a] %d, want A displaced once", prev, stale, cancels[a])
 	}
-	// A's repeat, read before its end: nothing.
-	if prev := h.claim(3, 1, a, cancelOf(a)); prev != nil || cancels[b] != 0 {
-		t.Fatalf("a displaced session's repeat took the index back: prev conn %d, cancels %v", prev.id, cancels)
+	// A's repeat, read before its end: A is already ending — nothing more, B untouched.
+	if prev, stale := h.claim(3, 1, a, cancelOf(a)); prev != nil || stale || cancels[b] != 0 || cancels[a] != 1 {
+		t.Fatalf("A's repeat after its end: prev %v stale %v cancels a %d b %d", prev, stale, cancels[a], cancels[b])
 	}
 	// B's own repeat: nothing.
-	if prev := h.claim(3, 2, b, cancelOf(b)); prev != nil || cancels[b] != 0 {
-		t.Fatalf("the holder's repeat ended itself: prev %v, cancels %v", prev != nil, cancels)
+	if prev, stale := h.claim(3, 2, b, cancelOf(b)); prev != nil || stale || cancels[b] != 0 {
+		t.Fatalf("B's own repeat: prev %v stale %v cancels[b] %d", prev, stale, cancels[b])
 	}
-	// B leaves; A's stale sentinel still finds the bar at 2.
+	// D, an older session of the index that was never a holder (its first copy
+	// late behind B's claim), generation 1 below the bar 2: D ends, B stays.
+	if prev, stale := h.claim(3, 1, d, cancelOf(d)); prev != nil || !stale || cancels[d] != 1 || cancels[b] != 0 || h.holder(3) != b {
+		t.Fatalf("D's stale claim: prev %v stale %v cancels d %d b %d holder %v — want D ended, B the holder", prev, stale, cancels[d], cancels[b], h.holder(3))
+	}
+	if r := reapReason(d.reaped.Load()); r != reapReplaced {
+		t.Fatalf("D's reap reason %v, want replaced", r)
+	}
+	// D's repeat: already ending — nothing more.
+	if prev, stale := h.claim(3, 1, d, cancelOf(d)); prev != nil || stale || cancels[d] != 1 {
+		t.Fatalf("D's repeat: prev %v stale %v cancels[d] %d", prev, stale, cancels[d])
+	}
+	// E AT the bar (generation 2) from another connection: not strictly older — nobody ends.
+	if prev, stale := h.claim(3, 2, e, cancelOf(e)); prev != nil || stale || cancels[e] != 0 || cancels[b] != 0 || h.holder(3) != b {
+		t.Fatalf("E at the bar: prev %v stale %v cancels e %d b %d holder %v — want nothing", prev, stale, cancels[e], cancels[b], h.holder(3))
+	}
+	// B leaves; A's stale sentinel still finds the bar at 2 (A already ending: nothing).
 	h.leave(b)
-	if prev := h.claim(3, 1, a, cancelOf(a)); prev != nil {
-		t.Fatal("after the holder left, an older generation claimed the index")
+	if prev, stale := h.claim(3, 1, a, cancelOf(a)); prev != nil || stale || cancels[a] != 1 {
+		t.Fatalf("A after B left: prev %v stale %v cancels[a] %d", prev, stale, cancels[a])
 	}
 	if h.holder(3) != nil {
-		t.Fatal("the stale claim was recorded as the holder")
+		t.Fatal("the index has a holder after B left")
 	}
 	// C, generation 3: the index is its.
-	if prev := h.claim(3, 3, c, cancelOf(c)); prev != nil || h.holder(3) != c {
-		t.Fatalf("the newest generation did not take a free index: prev %v, holder is c %v", prev != nil, h.holder(3) == c)
+	if prev, stale := h.claim(3, 3, c, cancelOf(c)); prev != nil || stale || h.holder(3) != c {
+		t.Fatalf("C's claim: prev %v stale %v holder %v", prev, stale, h.holder(3))
 	}
 	// The holder's own repeat, even with a number above its own: never its own end.
-	if prev := h.claim(3, 9, c, cancelOf(c)); prev != nil || cancels[c] != 0 || h.holder(3) != c {
-		t.Fatalf("the holder's repeat ended the holder: prev %v, cancels %v", prev != nil, cancels)
+	if prev, stale := h.claim(3, 9, c, cancelOf(c)); prev != nil || stale || cancels[c] != 0 || h.holder(3) != c {
+		t.Fatalf("the holder's repeat: prev %v stale %v cancels[c] %d holder %v", prev, stale, cancels[c], h.holder(3))
 	}
-	if cancels[a] != 1 || cancels[b] != 0 || cancels[c] != 0 {
-		t.Fatalf("cancels %v, want a once and nobody else", cancels)
+	if cancels[a] != 1 || cancels[b] != 0 || cancels[c] != 0 || cancels[d] != 1 || cancels[e] != 0 {
+		t.Fatalf("cancels a %d b %d c %d d %d e %d, want 1 0 0 1 0", cancels[a], cancels[b], cancels[c], cancels[d], cancels[e])
+	}
+	if got := reapsByReason[reapReplaced].Load() - replacedBefore; got != 2 {
+		t.Fatalf("the replaced count moved by %d, want 2 — A displaced, D stale", got)
 	}
 }

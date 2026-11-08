@@ -694,8 +694,12 @@ func pumpBidirectional(ctx context.Context, conn net.Conn, connect string, singl
 			// hello (the next tick's repeat claims).
 			if idx, gen, ok := isGroupReplace(buf[:n]); ok {
 				if b := bind.Load(); b.hub != nil && joined.Load() {
-					if prev := b.hub.claim(idx, gen, st, cancel2); prev != nil {
+					prev, stale := b.hub.claim(idx, gen, st, cancel2)
+					if prev != nil {
 						log.Printf("conn %d: the client names it the successor of its connection %d — conn %d, the predecessor, ends and leaves the group's queue", st.id, idx, prev.id)
+					}
+					if stale {
+						log.Printf("conn %d: its replacement sentinel names index %d at a generation below the one accepted — an older session that outlived its replacement; it ends, the holder stays", st.id, idx)
 					}
 				}
 				continue

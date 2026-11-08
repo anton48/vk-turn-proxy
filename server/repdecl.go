@@ -66,31 +66,56 @@ type hubMember struct {
 // reap reason set, the counter moved), returned here for the log. The
 // generation is the client's hand-out stamp: fixed for one session, higher
 // for every later session on the index.
-func (h *downlinkHub) claim(idx uint16, gen uint64, st *connStat, cancel func()) *connStat {
+//
+// AND A STALE SENDER ENDS (the user's review of a316b3c): a claim STRICTLY
+// below the bar from a connection that is not the holder comes from an older
+// session of that index — one that outlived its replacement (its first copy
+// late behind the successor's claim). Returning from here left it a member
+// and a consumer of the group's shared queue, the very thing the sentinel is
+// for: through the real pump it took 10 of the next 20 downlink packets. So
+// the sender is ended through its own cancel (stale = true, for the log), the
+// holder untouched; a claim AT the bar from another connection is not
+// strictly older and ends nobody.
+func (h *downlinkHub) claim(idx uint16, gen uint64, st *connStat, cancel func()) (prev *connStat, stale bool) {
 	h.membersMu.Lock()
 	if h.members == nil {
 		h.members = map[uint16]hubMember{}
 		h.maxGen = map[uint16]uint64{}
 	}
-	prev, had := h.members[idx]
-	if had && prev.st == st {
+	cur, had := h.members[idx]
+	if had && cur.st == st {
 		h.membersMu.Unlock()
-		return nil // the holder's own repeat, whatever it says: never its own end
+		return nil, false // the holder's own repeat, whatever it says: never its own end
 	}
 	if bar, barred := h.maxGen[idx]; barred && gen <= bar {
 		h.membersMu.Unlock()
-		return nil // an older session's late copy, or a displaced session's repeat: the index is not its
+		if gen == bar {
+			return nil, false // at the bar from another connection: not strictly older — nothing is known about it
+		}
+		// STRICTLY OLDER than a session already accepted on this index, and
+		// not the holder: a predecessor that outlived its replacement (the
+		// user's review of a316b3c). It claims nothing — and it ENDS, here,
+		// through its own cancel: left a member, it would go on taking from
+		// the group's queue (10 of the next 20 downlink packets, measured)
+		// until the zombie reaper. Once per connection: a copy it had read
+		// before its end finds it ending already.
+		if st.reaped.CompareAndSwap(int64(reapNone), int64(reapReplaced)) {
+			reapsByReason[reapReplaced].Add(1)
+			cancel()
+			return nil, true
+		}
+		return nil, false
 	}
 	h.members[idx] = hubMember{st: st, cancel: cancel, gen: gen}
 	h.maxGen[idx] = gen
 	h.membersMu.Unlock()
 	if !had {
-		return nil
+		return nil, false
 	}
-	prev.st.reaped.Store(int64(reapReplaced))
+	cur.st.reaped.Store(int64(reapReplaced))
 	reapsByReason[reapReplaced].Add(1)
-	prev.cancel()
-	return prev.st
+	cur.cancel()
+	return cur.st, false
 }
 
 // leave forgets st as a holder — at its connection's end, so that a later
