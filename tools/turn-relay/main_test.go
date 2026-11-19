@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -898,5 +899,225 @@ func TestAConnectionEndedOnABadFrameDoesNotHoldItsClientsNextConnection(t *testi
 	res := &stun.Message{Raw: append([]byte(nil), buf[:n]...)}
 	if err := res.Decode(); err != nil || res.Type.Class != stun.ClassSuccessResponse {
 		t.Fatalf("connection B's answer: %v %v", res.Type, err)
+	}
+}
+
+// A phone, 2026-11-19 (WRAP-A through the own relay, asleep on LTE): the
+// carrier gave the socket a new mapping, the relay saw the session's refreshes
+// arrive from a source it holds no allocation for — and said NOTHING. VK's
+// relays answer such a request (CreatePermission and ChannelBind 400, Refresh
+// 437) and the client ends the session on that answer at once; against this
+// relay it ran pion's whole ladder into silence and the session stood dead
+// until a liveness rule found it — minutes, for a transport that has none of
+// its own. The relay answers as VK's do (the fork's second divergence).
+
+type setterFunc func(*stun.Message) error
+
+func (f setterFunc) AddTo(m *stun.Message) error { return f(m) }
+
+// xorPeer is XOR-PEER-ADDRESS — pion keeps its type internal.
+func xorPeer(ip string, port int) stun.Setter {
+	return setterFunc(func(m *stun.Message) error {
+		return (&stun.XORMappedAddress{IP: net.ParseIP(ip), Port: port}).AddToAs(m, stun.AttrXORPeerAddress)
+	})
+}
+
+// rawRequest asks `to` from conn the way a client does — an unauthenticated
+// ask for the realm and the nonce, then the ask with them — and says what came
+// back: the answer's class and, for an error, its code; answered false when
+// nothing came within the wait.
+func rawRequest(t *testing.T, conn net.PacketConn, to net.Addr, method stun.Method, wait time.Duration, attrs ...stun.Setter) (class stun.MessageClass, code stun.ErrorCode, answered bool) {
+	t.Helper()
+	ask := func(m *stun.Message, wait time.Duration) *stun.Message {
+		if _, err := conn.WriteTo(m.Raw, to); err != nil {
+			t.Fatal(err)
+		}
+		buf := make([]byte, 1500)
+		_ = conn.SetReadDeadline(time.Now().Add(wait))
+		n, _, err := conn.ReadFrom(buf)
+		if err != nil {
+			return nil
+		}
+		res := &stun.Message{Raw: append([]byte(nil), buf[:n]...)}
+		if err := res.Decode(); err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+	first := ask(stun.MustBuild(stun.TransactionID, stun.NewType(method, stun.ClassRequest), stun.Fingerprint), 3*time.Second)
+	if first == nil {
+		t.Fatalf("fixture: the unauthenticated %s got no challenge", method)
+	}
+	var realm stun.Realm
+	var nonce stun.Nonce
+	if realm.GetFrom(first) != nil || nonce.GetFrom(first) != nil {
+		t.Fatalf("fixture: the challenge to %s carries no realm and nonce", method)
+	}
+	const user = "1793400000:1125900188966338"
+	set := append([]stun.Setter{stun.TransactionID, stun.NewType(method, stun.ClassRequest)}, attrs...)
+	set = append(set, stun.NewUsername(user), realm, nonce, stun.NewLongTermIntegrity(user, realm.String(), "a-password-the-relay-never-saw"), stun.Fingerprint)
+	req := stun.MustBuild(set...)
+	res := ask(req, wait)
+	if res == nil {
+		return 0, 0, false
+	}
+	if res.Type.Method != method || res.TransactionID != req.TransactionID {
+		t.Fatalf("the answer to %s is a %s of another transaction: %v", method, res.Type, res.TransactionID != req.TransactionID)
+	}
+	var ec stun.ErrorCodeAttribute
+	if res.Type.Class == stun.ClassErrorResponse {
+		if err := ec.GetFrom(res); err != nil {
+			t.Fatalf("an error response to %s with no code: %v", method, err)
+		}
+	}
+	return res.Type.Class, ec.Code, true
+}
+
+func TestARequestFromASourceWithNoAllocationIsAnsweredAsVKsRelaysAnswer(t *testing.T) {
+	r := testRelay(t, 8)
+	to := r.udp[0]
+	socket := func() net.PacketConn {
+		c, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { c.Close() })
+		return c
+	}
+	channel := stun.RawAttribute{Type: stun.AttrChannelNumber, Value: []byte{0x40, 0x00, 0, 0}}
+	for _, c := range []struct {
+		name   string
+		method stun.Method
+		attrs  []stun.Setter
+		want   stun.ErrorCode
+	}{
+		{"a permission", stun.MethodCreatePermission, []stun.Setter{xorPeer("127.0.0.1", 9)}, stun.CodeBadRequest},
+		{"a channel", stun.MethodChannelBind, []stun.Setter{channel, xorPeer("127.0.0.1", 9)}, stun.CodeBadRequest},
+		{"a refresh", stun.MethodRefresh, nil, stun.CodeAllocMismatch},
+		{"a deallocate", stun.MethodRefresh, []stun.Setter{stun.RawAttribute{Type: stun.AttrLifetime, Value: []byte{0, 0, 0, 0}}}, stun.CodeAllocMismatch},
+	} {
+		class, code, answered := rawRequest(t, socket(), to, c.method, 1500*time.Millisecond, c.attrs...)
+		if !answered {
+			t.Errorf("%s asked from a source with no allocation: no answer — the client runs its whole ladder into silence", c.name)
+			continue
+		}
+		if class != stun.ClassErrorResponse || code != c.want {
+			t.Errorf("%s asked from a source with no allocation: class %v, code %d — want an error response with %d, as VK's relays answer", c.name, class, code, c.want)
+		}
+	}
+	if r.seats.count() != 0 {
+		t.Fatalf("answering took a seat: %d held", r.seats.count())
+	}
+
+	// With an allocation the same asks are served, not refused.
+	holder := socket()
+	if granted, code := rawAllocate(t, holder, to); !granted {
+		t.Fatalf("fixture: the allocation was refused (%d)", code)
+	}
+	if class, code, answered := rawRequest(t, holder, to, stun.MethodCreatePermission, 1500*time.Millisecond, xorPeer("127.0.0.1", 9)); !answered || class != stun.ClassSuccessResponse {
+		t.Fatalf("a permission asked on a live allocation: answered %v, class %v, code %d — want a success", answered, class, code)
+	}
+	if class, code, answered := rawRequest(t, holder, to, stun.MethodRefresh, 1500*time.Millisecond); !answered || class != stun.ClassSuccessResponse {
+		t.Fatalf("a refresh of a live allocation: answered %v, class %v, code %d — want a success", answered, class, code)
+	}
+
+	// Data from a source with no allocation is still met with silence: an
+	// indication and a channel datagram are no requests, nothing answers them.
+	stray := socket()
+	send := stun.MustBuild(stun.TransactionID, stun.NewType(stun.MethodSend, stun.ClassIndication), xorPeer("127.0.0.1", 9),
+		stun.RawAttribute{Type: stun.AttrData, Value: []byte("data")})
+	for name, datagram := range map[string][]byte{"a Send indication": send.Raw, "a ChannelData datagram": {0x40, 0x00, 0x00, 0x04, 'd', 'a', 't', 'a'}} {
+		if _, err := stray.WriteTo(datagram, to); err != nil {
+			t.Fatal(err)
+		}
+		buf := make([]byte, 1500)
+		_ = stray.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		if n, _, err := stray.ReadFrom(buf); err == nil {
+			t.Fatalf("%s from a source with no allocation was answered (%d bytes) — only requests are", name, n)
+		}
+	}
+}
+
+// rebindConn is a client's socket behind a NAT that can give it a new mapping:
+// rebind moves the client onto a fresh socket — the relay sees its next
+// datagram arrive from another source, as behind a carrier's NAT after a sleep.
+type rebindConn struct {
+	mu  sync.Mutex
+	cur net.PacketConn
+}
+
+func (c *rebindConn) socket() net.PacketConn {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.cur
+}
+
+func (c *rebindConn) rebind(t *testing.T) {
+	t.Helper()
+	fresh, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	old := c.cur
+	c.cur = fresh
+	c.mu.Unlock()
+	_ = old.Close() // the reader moves on to the fresh socket
+}
+
+func (c *rebindConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	for {
+		s := c.socket()
+		n, addr, err := s.ReadFrom(p)
+		if err != nil && s != c.socket() {
+			continue // the old socket went with the mapping
+		}
+		return n, addr, err
+	}
+}
+
+func (c *rebindConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	return c.socket().WriteTo(p, addr)
+}
+func (c *rebindConn) Close() error                       { return c.socket().Close() }
+func (c *rebindConn) LocalAddr() net.Addr                { return c.socket().LocalAddr() }
+func (c *rebindConn) SetDeadline(t time.Time) error      { return c.socket().SetDeadline(t) }
+func (c *rebindConn) SetReadDeadline(t time.Time) error  { return c.socket().SetReadDeadline(t) }
+func (c *rebindConn) SetWriteDeadline(t time.Time) error { return c.socket().SetWriteDeadline(t) }
+
+// Through the client's own stack: a pion client whose mapping changed asks for
+// a permission and hears the words the app's sessions end on — pion's
+// "error response (error 400:" — within the round trip, not after its ladder.
+func TestAClientWhoseMappingChangedHearsTheAnswerItsSessionEndsOn(t *testing.T) {
+	r := testRelay(t, 8)
+	first, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nat := &rebindConn{cur: first}
+	c := vkClient(t, r.udp[0].String(), nat)
+	relayConn, err := c.Allocate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relayConn.Close()
+	if err := c.CreatePermission(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}); err != nil {
+		t.Fatalf("fixture: the permission on the first mapping: %v", err)
+	}
+	nat.rebind(t)
+	asked := time.Now()
+	err = c.CreatePermission(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 10})
+	took := time.Since(asked)
+	if err == nil {
+		t.Fatal("fixture: a permission was granted to a source that holds no allocation")
+	}
+	if !strings.Contains(err.Error(), "error response (error 400:") {
+		t.Fatalf("behind a changed mapping the client heard %q after %s — want the relay's 400, the words its session ends on", err, took.Round(time.Millisecond))
+	}
+	if took > 2*time.Second {
+		t.Fatalf("the 400 took %s — an answer is a round trip, not the client's ladder", took.Round(time.Millisecond))
+	}
+	if r.seats.count() != 1 {
+		t.Fatalf("allocations held: %d, want the one of the first mapping (it lives on under the old source)", r.seats.count())
 	}
 }

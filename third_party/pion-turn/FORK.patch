@@ -1,5 +1,59 @@
+=== internal/server/turn.go ===
+@@ -305,7 +305,7 @@
+ 
+ 	a := req.AllocationManager.GetAllocationForUserID(fiveTuple, userID) //nolint:varnamelen
+ 	if a == nil {
+-		return fmt.Errorf("%w %v:%v", errNoAllocationFound, req.SrcAddr, req.Conn.LocalAddr())
++		return answerNoAllocation(req, stunMsg, stun.CodeAllocMismatch) // FORK: answered, see util.go
+ 	}
+ 
+ 	// RFC 6156: If REQUESTED-ADDRESS-FAMILY is present in Refresh request,
+@@ -382,7 +382,7 @@
+ 		Protocol: allocation.UDP,
+ 	}, userID)
+ 	if alloc == nil {
+-		return fmt.Errorf("%w %v:%v", errNoAllocationFound, req.SrcAddr, req.Conn.LocalAddr())
++		return answerNoAllocation(req, stunMsg, stun.CodeBadRequest) // FORK: answered, see util.go
+ 	}
+ 
+ 	addCount := 0
+@@ -493,7 +493,7 @@
+ 		Protocol: allocation.UDP,
+ 	}, userID)
+ 	if alloc == nil {
+-		return fmt.Errorf("%w %v:%v", errNoAllocationFound, req.SrcAddr, req.Conn.LocalAddr())
++		return answerNoAllocation(req, stunMsg, stun.CodeBadRequest) // FORK: answered, see util.go
+ 	}
+ 
+ 	var channel proto.ChannelNumber
+
 === internal/server/util.go ===
-@@ -120,12 +120,16 @@
+@@ -49,6 +49,24 @@
+ 	return append([]stun.Setter{&stun.Message{TransactionID: transactionID}, msgType}, additional...)
+ }
+ 
++// FORK (vk-turn-proxy, tools/turn-relay): a REQUEST whose 5-tuple has no
++// allocation is ANSWERED with an error response — upstream returns the error
++// and sends nothing. A client behind a NAT that gave its socket a new mapping
++// (a phone asleep on a carrier's network) asks from a source the server holds
++// no allocation for; left unanswered it runs its whole retransmission ladder
++// and the session above stands dead until some liveness rule finds it. VK's
++// relays answer, and the client this relay serves ends the session on that
++// answer at once — so the codes are VK's (measured): 400 to CreatePermission
++// and ChannelBind, 437 to Refresh. The request has passed authenticateRequest
++// by then: only a sender that holds a nonce of this server is answered.
++// Indications and ChannelData from such a source are still met with silence.
++// The error is returned as before — the caller's event is raised all the same.
++func answerNoAllocation(req Request, stunMsg *stun.Message, code stun.ErrorCode) error {
++	return buildAndSendErr(req.Conn, req.SrcAddr,
++		fmt.Errorf("%w %v:%v", errNoAllocationFound, req.SrcAddr, req.Conn.LocalAddr()),
++		buildMsg(stunMsg.TransactionID, stun.NewType(stunMsg.Type.Method, stun.ClassErrorResponse), code)...)
++}
++
+ func authenticateRequest(req Request, stunMsg *stun.Message, callingMethod stun.Method) (
+ 	messageIntegrity stun.MessageIntegrity,
+ 	hasAuth bool,
+@@ -120,12 +138,16 @@
  		)
  	}
  

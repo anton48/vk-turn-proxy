@@ -8,11 +8,12 @@ that `tools/turn-relay`'s `go.mod` can `replace github.com/pion/turn/v5` with
 this tree. The app and the console keep using pristine upstream from the
 module cache: this fork is for the relay tool ONLY.
 
-**ONE deliberate divergence**, guarded by `FORK.patch`:
+**TWO deliberate divergences**, guarded by `FORK.patch`:
 
 | # | divergence | file |
 |---|---|---|
 | 1 | the request's MESSAGE-INTEGRITY is not checked (`authenticateRequest`) | `internal/server/util.go` |
+| 2 | a request from a 5-tuple that has no allocation is ANSWERED — 400 to CreatePermission and ChannelBind, 437 to Refresh (`answerNoAllocation`) | `internal/server/util.go`, `internal/server/turn.go` |
 
 Why: the relay stands in the TURN override list of a client that signs its
 requests with the credentials VK issued — a password this server cannot know
@@ -23,10 +24,27 @@ still validated. What keeps the relay from being an open one is the
 `PermissionHandler` (the peers allowed) and the `QuotaHandler` (the
 allocations), set by `tools/turn-relay`.
 
+Why (2): a client behind a NAT that gave its socket a new mapping — a phone
+asleep on a carrier's network — sends its refreshes from a source the server
+holds no allocation for. Upstream returns `errNoAllocationFound` and sends
+nothing: the client runs its whole retransmission ladder into silence and the
+session above stands dead until a liveness rule finds it (a phone,
+2026-11-19: minutes, for a transport with no such rule of its own). VK's
+relays ANSWER such a request, and the client this relay serves ends the
+session on that answer at once; the codes are theirs, as measured — 400 to
+CreatePermission and ChannelBind, 437 to Refresh. The answer is sent behind
+`authenticateRequest`, so only to a sender that holds a nonce of this server;
+Send indications and ChannelData from such a source are still met with
+silence; the error is returned to the caller as before.
+
 Re-apply recipe (after an upstream bump): in `internal/server/util.go`,
 `authenticateRequest`, replace the `stun.MessageIntegrity(ourKey).Check(…)`
 block (the failed-auth event and the 400) with `_ = ourKey` and the comment
-above it; keep `genAuthEvent(…, true)`. Then regenerate `FORK.patch`:
+above it; keep `genAuthEvent(…, true)`. For (2): add `answerNoAllocation` to
+`internal/server/util.go` and, in `internal/server/turn.go`, return it where
+`handleRefreshRequest` (437), `handleCreatePermissionRequest` (400) and
+`handleChannelBindRequest` (400) find no allocation. Then regenerate
+`FORK.patch`:
 
     cd third_party/pion-turn && UPDATE_FORK_PATCH=1 go test . -run TestForkDiverges
 

@@ -7,7 +7,10 @@
 // so it runs on a fork of pion/turn that does not check the request's
 // MESSAGE-INTEGRITY (third_party/pion-turn, FORK.md). What keeps it from being
 // an open relay: it sends only to the peers named by -peer (the WireGuard /
-// SRTP server), and it holds at most -max-allocs allocations at once.
+// SRTP server), and it holds at most -max-allocs allocations at once. The fork
+// also ANSWERS a request from a source that has no allocation — a client whose
+// NAT mapping changed — as VK's relays do (400 / 437), so that the client ends
+// such a session at once instead of waiting out its retransmissions.
 //
 //	turn-relay -listen 127.0.0.1:3478 -peer 203.0.113.5           # a self-test on a stand
 //	turn-relay -listen 0.0.0.0:3478 -public-ip 198.51.100.7 -peer 203.0.113.5

@@ -3,7 +3,8 @@
 #
 #   1. the root module (./server, ./client, …) — go test, -race when RACE=1;
 #   2. the vendored fork of pion/turn (third_party/pion-turn — the request's
-#      MESSAGE-INTEGRITY check removed, for tools/turn-relay ONLY: the user's
+#      MESSAGE-INTEGRITY check removed, and a request with no allocation
+#      answered as VK's relays answer it; for tools/turn-relay ONLY: the user's
 #      own relay accepts the credentials VK issued): its guard diffs the tree
 #      against pristine upstream and compares with FORK.patch, and the patched
 #      server package's own tests run; a module of its own, never reached by

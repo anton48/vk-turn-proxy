@@ -305,7 +305,7 @@ func handleRefreshRequest(req Request, stunMsg *stun.Message) error {
 
 	a := req.AllocationManager.GetAllocationForUserID(fiveTuple, userID) //nolint:varnamelen
 	if a == nil {
-		return fmt.Errorf("%w %v:%v", errNoAllocationFound, req.SrcAddr, req.Conn.LocalAddr())
+		return answerNoAllocation(req, stunMsg, stun.CodeAllocMismatch) // FORK: answered, see util.go
 	}
 
 	// RFC 6156: If REQUESTED-ADDRESS-FAMILY is present in Refresh request,
@@ -382,7 +382,7 @@ func handleCreatePermissionRequest(req Request, stunMsg *stun.Message) error {
 		Protocol: allocation.UDP,
 	}, userID)
 	if alloc == nil {
-		return fmt.Errorf("%w %v:%v", errNoAllocationFound, req.SrcAddr, req.Conn.LocalAddr())
+		return answerNoAllocation(req, stunMsg, stun.CodeBadRequest) // FORK: answered, see util.go
 	}
 
 	addCount := 0
@@ -493,7 +493,7 @@ func handleChannelBindRequest(req Request, stunMsg *stun.Message) error { // nol
 		Protocol: allocation.UDP,
 	}, userID)
 	if alloc == nil {
-		return fmt.Errorf("%w %v:%v", errNoAllocationFound, req.SrcAddr, req.Conn.LocalAddr())
+		return answerNoAllocation(req, stunMsg, stun.CodeBadRequest) // FORK: answered, see util.go
 	}
 
 	var channel proto.ChannelNumber

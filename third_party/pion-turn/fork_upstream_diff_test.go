@@ -19,7 +19,7 @@ const upstreamVersion = "v5.0.2"
 // them is pinned by the golden patch (forkPatchFile) — a count is no check on
 // content (see third_party/speedtest-go, where this guard comes from).
 var (
-	wantChangedFiles = []string{"internal/server/util.go"}
+	wantChangedFiles = []string{"internal/server/turn.go", "internal/server/util.go"}
 	wantAddedFiles   = []string{"fork_upstream_diff_test.go"}
 )
 
